@@ -13,6 +13,30 @@ CANable v1 with candlelight firmware. The Pro 2.0 works with this tool because
 both firmwares expose the same gs_usb interface; the Bafang bus is classic CAN
 at 250 kbit/s, so the FD capability of the Pro 2.0 is not used.
 
+### Which firmware, and why it matters
+
+candleLight and gs_usb are not alternatives: candleLight is the firmware on
+the adapter's STM32, gs_usb is the USB protocol that firmware speaks (named
+after the Linux kernel driver for it). The real choice is between the
+candleLight/gs_usb firmware your board ships with and the slcan firmware you
+could flash instead.
+
+| | gs_usb (candleLight) | slcan |
+| --- | --- | --- |
+| Wire format | binary frames | ASCII over a CDC serial port |
+| Throughput | limited by the CAN bus | ~3x byte overhead, limited by the UART |
+| Timestamps | from the adapter | host-side only |
+| Error frames | yes | usually not |
+| Linux | native kernel driver, real SocketCAN | needs the `slcand` daemon |
+| macOS / Windows | needs libusb | any serial port, no libusb |
+| Debugging | opaque binary | human-readable |
+
+For a Bafang bus -- 250 kbit/s, request/response, low volume -- slcan is
+entirely adequate. gs_usb is the better choice for sniffing a busy bus, and on
+Linux it gives you SocketCAN, which means `candump` captures that feed
+straight into `bafang-can decode-log`. It is also what the Pro 2.0 ships with,
+so it is the default here purely to avoid making you flash anything.
+
 ## Host prerequisites
 
 macOS:

@@ -72,6 +72,25 @@ bafang-can --interface sim --sim-state bike.json get Parameter1.current_limit
 bafang-can --interface sim --sim-state bike.json restore baseline.json --apply
 ```
 
+## Where the simulator's data comes from
+
+Its **framing** is derived from the vendored implementation and independently
+verified against it. Its **values are invented** -- plausible numbers for a
+250 W / 36 V mid-drive, not a capture from a real M200; the identity strings
+are made up too.
+
+There is a circularity worth naming: the simulator builds its payloads with
+this package's own `int_to_bytes_le` and `checksum`, so a decoding bug shared
+between the simulator and the codecs would be invisible to any test that only
+uses the simulator. That is the whole reason layer 3 exists -- the vendored
+JavaScript is an oracle written by someone else, from someone else's reading
+of the protocol. Layer 4 covers wiring and CLI behaviour; it does not
+establish that the byte layouts are right.
+
+Replacing the invented values with a recorded capture from a real bike would
+be a strict improvement. `bafang-can sniff` plus `decode-log` is how to make
+one once the adapter arrives.
+
 ## What this does *not* prove
 
 * That the CANable Pro 2.0 enumerates and passes traffic — that needs the

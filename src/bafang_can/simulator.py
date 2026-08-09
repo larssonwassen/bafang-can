@@ -9,6 +9,30 @@ can be exercised end to end before any hardware exists. Use it with
 It answers as a plausible M200-class drive unit plus display, torque sensor
 and battery. The numbers move a little between reads so ``monitor`` shows
 something alive.
+
+Provenance -- what is real here and what is invented
+----------------------------------------------------
+* **Framing and behaviour: derived from the vendored implementation**
+  (``vendor/bafang_canable_pro/canbus.js`` and ``bafang-serializer.js``), and
+  independently verified -- ``tests/test_differential_write.py`` proves the
+  frames this package emits are byte-identical to the vendor serializer's.
+* **Which commands answer: from the merged command table.** 0x60/0x17 and
+  0x60/0x18 deliberately return ERROR_ACK so ``probe`` shows a realistic mix
+  of supported and unsupported commands.
+* **The field values: invented.** They are plausible numbers for a 250 W /
+  36 V mid-drive, not a capture from a real M200. The identity strings
+  ("M200.G210", "CRX10.M200.1.0") are made up. Nothing here should be used to
+  conclude what your motor will report.
+
+Note the circularity this creates: the payloads below are built with this
+package's own ``int_to_bytes_le`` and ``checksum``, so a decoding bug shared
+by the simulator and the codecs would be invisible to any test that only uses
+this module. That is why the differential tests exist -- the vendored
+JavaScript is the external oracle. Tests here cover wiring and CLI behaviour;
+correctness of the byte layouts is established elsewhere.
+
+Replacing this with a recorded capture from a real bike (see
+``bafang-can sniff`` and ``decode-log``) would be a strict improvement.
 """
 
 from __future__ import annotations
