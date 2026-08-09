@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/xclose/projects/bafang-can status)",
+      "WebSearch"
+    ]
+  }
+}

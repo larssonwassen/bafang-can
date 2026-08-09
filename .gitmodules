@@ -1,0 +1,6 @@
+[submodule "vendor/OpenBafangTool"]
+	path = vendor/OpenBafangTool
+	url = https://github.com/andrey-pr/OpenBafangTool.git
+[submodule "vendor/bafang_canable_pro"]
+	path = vendor/bafang_canable_pro
+	url = https://github.com/mdi-9/bafang_canable_pro.git

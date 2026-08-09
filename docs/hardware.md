@@ -1,0 +1,73 @@
+# CANable Pro 2.0 setup
+
+## The adapter
+
+The CANable Pro 2.0 is an STM32G431 with a galvanically isolated transceiver.
+It ships with **candleLight-FD** firmware, which speaks the `gs_usb` USB
+protocol — that is what `--interface gs_usb` (the default) uses. If your board
+has been reflashed to the **slcan/CANtact** firmware it enumerates as a USB CDC
+serial port instead; use `--interface slcan --channel /dev/tty.usbmodemXXXX`.
+
+Note that the older `bafang_canable_pro` README asks for an STM32F072-based
+CANable v1 with candlelight firmware. The Pro 2.0 works with this tool because
+both firmwares expose the same gs_usb interface; the Bafang bus is classic CAN
+at 250 kbit/s, so the FD capability of the Pro 2.0 is not used.
+
+## Host prerequisites
+
+macOS:
+
+```bash
+brew install libusb
+```
+
+Debian/Ubuntu:
+
+```bash
+sudo apt install libusb-1.0-0
+```
+
+Linux users can also load the mainline `gs_usb` kernel driver and use
+SocketCAN instead:
+
+```bash
+sudo ip link set can0 up type can bitrate 250000
+```
+
+then run with `--interface socketcan --channel can0`.
+
+## Wiring
+
+Bafang systems break the CAN pair out on the display/BESST connector (the
+higher-density connector at the motor, or the display's diagnostic branch).
+You need three things connected:
+
+* CAN-H  → CANable CAN-H
+* CAN-L  → CANable CAN-L
+* GND    → CANable GND (the isolated side)
+
+The adapter must **not** feed power into the bike, and the bike must be
+powered from its own battery while you work — the drive unit does not answer
+with the system switched off.
+
+Termination: the bike harness is already terminated at both ends. Leave the
+CANable's 120 Ω termination jumper **off** when tapping into a complete bike.
+Turn it on only on a bench harness where the motor is the sole other node.
+
+## First contact
+
+```bash
+bafang-can adapters      # is the adapter visible at all
+bafang-can scan          # which nodes answer
+bafang-can probe         # which commands this firmware implements
+bafang-can diagnose      # read-only health report
+```
+
+If `scan` finds nothing:
+
+1. Confirm the bike is switched on (display lit).
+2. Swap CAN-H and CAN-L — reversed pairs are the most common mistake.
+3. Confirm 250 kbit/s (`--bitrate 250000`, the default).
+4. Run `bafang-can sniff --passive` — if the display and drive unit are
+   talking to each other you will see traffic even when nothing answers you,
+   which proves the wiring and bit rate are right and points at addressing.

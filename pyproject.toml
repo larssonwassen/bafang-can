@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bafang-can"
+version = "0.1.0"
+description = "Diagnose, calibrate and configure a Bafang M200 (G210) over CAN with a CANable Pro 2.0"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+dependencies = [
+    "python-can>=4.3",
+    "gs-usb>=0.3",     # candleLight/CANable transport used by python-can
+    "pyusb>=1.2",
+    "pyserial>=3.5",   # slcan firmware and adapter discovery
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+bafang-can = "bafang_can.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
