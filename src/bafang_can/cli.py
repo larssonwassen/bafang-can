@@ -17,7 +17,7 @@ from typing import Any
 
 from . import codecs
 from .commands import READ, WRITE, Command
-from .constants import DeviceId, WHEEL_TABLE, wheel_by_text
+from .constants import WHEEL_TABLE, DeviceId, wheel_by_text
 from .frame import BafangId
 from .profiles import m200
 from .protocol import BafangClient, BafangError
@@ -74,25 +74,38 @@ def _print_human(value: Any, indent: int = 0) -> None:
 
 
 def _connect(args) -> tuple[BafangClient, BafangSystem]:
+    extra: dict[str, Any] | None = None
+    if args.interface == "sim":
+        extra = {
+            "errors": [int(c) for c in args.sim_errors.split(",") if c.strip()]
+            if args.sim_errors is not None
+            else None,
+            "pedalling": not args.sim_idle,
+            "state_path": args.sim_state,
+        }
+        extra = {k: v for k, v in extra.items() if v is not None}
     config = AdapterConfig(
         interface=args.interface,
         channel=args.channel,
         bitrate=args.bitrate,
         index=args.index,
+        extra=extra,
     )
     bus = open_bus(config)
-    client = BafangClient(bus, timeout=args.timeout).start()
+    client = BafangClient(
+        bus, timeout=args.timeout, interframe_delay=args.write_delay
+    ).start()
     return client, BafangSystem(client)
 
 
 def _device(name: str) -> DeviceId:
     try:
         return DeviceId[name.upper()]
-    except KeyError:
+    except KeyError as exc:
         raise SystemExit(
             f"unknown device '{name}'. Known: "
             + ", ".join(d.name.lower() for d in DeviceId)
-        )
+        ) from exc
 
 
 def _confirm(args, what: str) -> bool:
@@ -142,8 +155,15 @@ def cmd_scan(args) -> int:
 def cmd_info(args) -> int:
     client, system = _connect(args)
     try:
-        devices = [_device(args.device)] if args.device else list(
-            (DeviceId.DRIVE_UNIT, DeviceId.DISPLAY, DeviceId.TORQUE_SENSOR, DeviceId.BATTERY)
+        devices = (
+            [_device(args.device)]
+            if args.device
+            else [
+                DeviceId.DRIVE_UNIT,
+                DeviceId.DISPLAY,
+                DeviceId.TORQUE_SENSOR,
+                DeviceId.BATTERY,
+            ]
         )
         out = {}
         for device in devices:
@@ -584,13 +604,137 @@ def cmd_commands(args) -> int:
 def cmd_decode(args) -> int:
     """Decode a CAN identifier without touching hardware."""
     ident = BafangId.decode(int(args.can_id, 0))
-    _print(dataclasses.asdict(ident) | {"text": str(ident)}, args.json)
+    _print(dict(dataclasses.asdict(ident), text=str(ident)), args.json)
+    return 0
+
+
+def cmd_decode_log(args) -> int:
+    """Decode a recorded capture offline (candump, ASC, BLF, CSV, TRC)."""
+    import can
+
+    known: dict[tuple[int, int], str] = {}
+    for _table, entries in (("read", READ), ("write", WRITE)):
+        for name, command in entries.items():
+            key = (command.code, command.subcode)
+            existing = known.get(key)
+            if existing is None:
+                known[key] = name
+            elif existing != name:
+                # Same code/subcode means different things per direction.
+                known[key] = f"{existing}|{name}"
+    rows = []
+    counts: dict[str, int] = {}
+    with can.LogReader(args.file) as reader:
+        for message in reader:
+            if not message.is_extended_id:
+                continue
+            ident = BafangId.decode(message.arbitration_id)
+            label = known.get((ident.code, ident.subcode), "")
+            rows.append(
+                {
+                    "timestamp": round(message.timestamp, 4),
+                    "id": str(ident),
+                    "command": label,
+                    "data": bytes(message.data).hex(),
+                }
+            )
+            counts[f"{ident} {label}".strip()] = (
+                counts.get(f"{ident} {label}".strip(), 0) + 1
+            )
+    if args.summary:
+        _print(
+            [
+                {"frames": count, "message": text}
+                for text, count in sorted(counts.items(), key=lambda kv: -kv[1])
+            ],
+            args.json,
+        )
+        return 0
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            print(
+                f"{row['timestamp']:14.4f} {row['id']:<44} "
+                f"{row['command']:<26} {row['data']}"
+            )
     return 0
 
 
 # ---------------------------------------------------------------------------
 # argument parsing
 # ---------------------------------------------------------------------------
+
+
+def _add_global_options(parser: argparse.ArgumentParser, defaults: bool) -> None:
+    """Global options.
+
+    They are added to the top-level parser *and* to every subparser, so
+    ``bafang-can -y set ...`` and ``bafang-can set ... -y`` both work. The
+    subparser copies use SUPPRESS as their default, otherwise parsing the
+    subcommand would reset whatever was given before it.
+    """
+    hide = argparse.SUPPRESS
+
+    def default(value):
+        return value if defaults else hide
+
+    parser.add_argument(
+        "--interface",
+        default=default("gs_usb"),
+        help="python-can interface: gs_usb (default), slcan, socketcan, or "
+        "'sim' for the built-in simulated bike",
+    )
+    parser.add_argument(
+        "--channel", default=default(None), help="channel, e.g. a serial port for slcan"
+    )
+    parser.add_argument(
+        "--bitrate", type=int, default=default(250_000), help="default: 250000"
+    )
+    parser.add_argument(
+        "--index", type=int, default=default(0), help="gs_usb device index"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=default(2.0), help="request timeout in seconds"
+    )
+    parser.add_argument(
+        "--write-delay",
+        type=float,
+        default=default(0.02),
+        help="seconds between frames of a multi-frame write (default: 0.02); "
+        "raise it if long writes are refused",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=default(False),
+        help="machine readable output",
+    )
+    parser.add_argument("-v", "--verbose", action="count", default=default(0))
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        default=default(False),
+        help="skip confirmations",
+    )
+    parser.add_argument(
+        "--sim-errors",
+        default=default(None),
+        help="with --interface sim: stored error codes, e.g. 8,21 (empty for none)",
+    )
+    parser.add_argument(
+        "--sim-idle",
+        action="store_true",
+        default=default(False),
+        help="with --interface sim: bike standing still instead of being ridden",
+    )
+    parser.add_argument(
+        "--sim-state",
+        default=default(None),
+        help="with --interface sim: JSON file keeping the simulated bike's "
+        "configuration between runs, so a whole workflow can be rehearsed",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -601,68 +745,67 @@ def build_parser() -> argparse.ArgumentParser:
             "using a CANable Pro 2.0."
         ),
     )
-    parser.add_argument("--interface", default="gs_usb", help="python-can interface (default: gs_usb)")
-    parser.add_argument("--channel", default=None, help="channel, e.g. a serial port for slcan")
-    parser.add_argument("--bitrate", type=int, default=250_000, help="default: 250000")
-    parser.add_argument("--index", type=int, default=0, help="gs_usb device index")
-    parser.add_argument("--timeout", type=float, default=2.0, help="request timeout in seconds")
-    parser.add_argument("--json", action="store_true", help="machine readable output")
-    parser.add_argument("-v", "--verbose", action="count", default=0)
-    parser.add_argument("-y", "--yes", action="store_true", help="skip confirmations")
+    _add_global_options(parser, defaults=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    _add_global_options(common, defaults=False)
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("adapters", help="list CAN adapters that are attached").set_defaults(func=cmd_adapters)
+    def add(name: str, **kwargs) -> argparse.ArgumentParser:
+        return sub.add_parser(name, parents=[common], **kwargs)
 
-    sub.add_parser("scan", help="which devices answer on the bus").set_defaults(func=cmd_scan)
+    add("adapters", help="list CAN adapters that are attached").set_defaults(func=cmd_adapters)
 
-    p = sub.add_parser("info", help="identity of every device")
+    add("scan", help="which devices answer on the bus").set_defaults(func=cmd_scan)
+
+    p = add("info", help="identity of every device")
     p.add_argument("--device", help="drive_unit, display, torque_sensor, battery")
     p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("probe", help="find out which commands this firmware answers")
+    p = add("probe", help="find out which commands this firmware answers")
     p.add_argument("--device", help="default: drive_unit")
     p.set_defaults(func=cmd_probe)
 
-    sub.add_parser("diagnose", help="full read-only health report").set_defaults(func=cmd_diagnose)
+    add("diagnose", help="full read-only health report").set_defaults(func=cmd_diagnose)
 
-    p = sub.add_parser("monitor", help="live telemetry")
+    p = add("monitor", help="live telemetry")
     p.add_argument("--interval", type=float, default=0.5)
     p.add_argument("--seconds", type=float, default=0, help="0 = until interrupted")
     p.set_defaults(func=cmd_monitor)
 
-    p = sub.add_parser("sniff", help="decode every frame on the bus")
+    p = add("sniff", help="decode every frame on the bus")
     p.add_argument("--seconds", type=float, default=0)
     p.add_argument("--passive", action="store_true", help="never transmit, not even ACKs")
     p.set_defaults(func=cmd_sniff)
 
-    p = sub.add_parser("errors", help="read (and optionally clear) stored error codes")
+    p = add("errors", help="read (and optionally clear) stored error codes")
     p.add_argument("--device")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_errors)
 
-    p = sub.add_parser("dump", help="back up the whole configuration to JSON")
+    p = add("dump", help="back up the whole configuration to JSON")
     p.add_argument("-o", "--output")
     p.set_defaults(func=cmd_dump)
 
-    p = sub.add_parser("restore", help="write a dump back to the drive unit")
+    p = add("restore", help="write a dump back to the drive unit")
     p.add_argument("file")
     p.add_argument("--blocks", help="comma separated subset, e.g. Parameter1,Parameter2")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_restore)
 
-    p = sub.add_parser("get", help="read a block or a single field")
+    p = add("get", help="read a block or a single field")
     p.add_argument("path", help="e.g. Parameter1 or Parameter1.assist_levels.0.current_limit")
     p.set_defaults(func=cmd_get)
 
-    p = sub.add_parser("set", help="change fields (read-modify-write, verified)")
+    p = add("set", help="change fields (read-modify-write, verified)")
     p.add_argument("assignment", nargs="+", help="block.field=value")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--force", action="store_true", help="ignore safety checks")
     p.set_defaults(func=cmd_set)
 
-    p = sub.add_parser("wheel", help="wheel size, circumference and speed limit")
+    p = add("wheel", help="wheel size, circumference and speed limit")
     p.add_argument("--diameter", help='e.g. 27.5 or 29 or "700mm"')
     p.add_argument("--circumference", type=int, help="mm")
     p.add_argument("--speed-limit", type=float, help="km/h")
@@ -670,12 +813,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_wheel)
 
-    p = sub.add_parser("calibrate", help="torque sensor zero or rotor position")
+    p = add("calibrate", help="torque sensor zero or rotor position")
     p.add_argument("target", choices=("torque", "position"))
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_calibrate)
 
-    p = sub.add_parser("raw", help="raw command access for protocol work")
+    p = add("raw", help="raw command access for protocol work")
     p.add_argument("code")
     p.add_argument("subcode")
     p.add_argument("--device", default="drive_unit")
@@ -683,11 +826,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_raw)
 
-    sub.add_parser("commands", help="print the known command tables").set_defaults(func=cmd_commands)
+    add("commands", help="print the known command tables").set_defaults(func=cmd_commands)
 
-    p = sub.add_parser("decode", help="decode a 29-bit Bafang CAN id (offline)")
+    p = add("decode", help="decode a 29-bit Bafang CAN id (offline)")
     p.add_argument("can_id")
     p.set_defaults(func=cmd_decode)
+
+    p = add(
+        "decode-log", help="decode a recorded capture offline (candump/asc/blf/csv)"
+    )
+    p.add_argument("file")
+    p.add_argument("--summary", action="store_true", help="count frames per message")
+    p.set_defaults(func=cmd_decode_log)
 
     return parser
 

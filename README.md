@@ -31,6 +31,17 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 macOS also needs libusb for the gs_usb transport: `brew install libusb`.
 See [docs/hardware.md](docs/hardware.md) for wiring and firmware notes.
 
+## Try it without hardware
+
+A simulated bike is built in, implementing the same framing rules as the real
+bus, so every command below works before the adapter arrives:
+
+```bash
+bafang-can --interface sim diagnose
+bafang-can --interface sim monitor
+bafang-can --interface sim --sim-state bike.json set Parameter1.current_limit=12 --apply
+```
+
 ## Use
 
 ```bash
@@ -43,6 +54,7 @@ bafang-can monitor                  # live speed/voltage/current/torque/cadence
 bafang-can sniff --passive          # decode traffic without transmitting
 bafang-can errors                   # stored fault codes with descriptions
 bafang-can dump -o baseline.json    # full configuration backup
+bafang-can decode-log ride.log      # decode a recorded capture offline
 ```
 
 Changing things — every write is a dry run until `--apply`:
@@ -85,18 +97,35 @@ src/bafang_can/
   protocol.py     requests, acks, multi-frame transfers, timeouts
   system.py       high-level device access, dump and restore
   profiles/m200.py  M200 (G210) limits and diagnostic checklist
+  simulator.py    a simulated bike, for working without hardware
   cli.py          the command line interface
-docs/             protocol notes, hardware setup, M200 workflow
+docs/             protocol notes, hardware setup, M200 workflow, testing
 vendor/           the two upstream projects, as submodules
-tests/            protocol and codec tests against a simulated drive unit
+tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 ```
+
+## Validation
+
+Run `pytest` (67 tests, ~25 s). Four layers, described in
+[docs/testing.md](docs/testing.md):
+
+1. Unit tests for identifiers, checksums, offsets and scaling.
+2. Round-trip fuzz: 200 random blocks per parameter block must decode and
+   re-encode to the same bytes. This caught a real defect where boolean fields
+   rewrote their byte as 0/1 and discarded whatever else it held.
+3. Differential tests that run the **vendored JavaScript** under node and
+   compare field by field in both directions. The multi-frame write frames
+   this tool emits are byte-identical to the vendor serializer's. This also
+   found a missing field (`speed_limit_enabled`, Parameter1 byte 36).
+4. End-to-end CLI tests against the built-in simulator.
 
 ## Status and honesty about the M200
 
-The protocol layer is exercised by tests against a simulated drive unit
-(`.venv/bin/python -m pytest`). The parameter *semantics* come from motors of
-the M500/M600 generation: neither upstream project lists the M200 as tested
-hardware, and Bafang has moved fields between firmware generations. Read
+What is verified is the *protocol*: framing, checksums, offsets, and agreement
+with both upstream implementations. What is not verified is that an M200
+(G210) lays its parameter blocks out like the M500/M600 generation that both
+upstream projects target — neither lists the M200 as tested hardware, and
+Bafang has moved fields between firmware generations. Read
 [docs/m200.md](docs/m200.md) before writing anything, back up first, and change
 one field at a time.
 

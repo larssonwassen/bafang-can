@@ -18,8 +18,9 @@ Layout sources
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, asdict
-from typing import Any, Sequence
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any
 
 from .constants import (
     LOW_VOLTAGE_LIMITS,
@@ -48,8 +49,8 @@ def _u24(data: Sequence[int], offset: int) -> int:
     return data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16)
 
 
-def _put16(buf: list[int], offset: int, value: int) -> None:
-    low, high = int_to_bytes_le(int(round(value)), 2)
+def _put16(buf: list[int], offset: int, value: float) -> None:
+    low, high = int_to_bytes_le(round(value), 2)
     buf[offset] = low
     buf[offset + 1] = high
 
@@ -88,6 +89,18 @@ class Block:
         buf[63] = checksum(buf[:63])
         return bytes(buf)
 
+    def _put_flag(self, buf: list[int], offset: int, value: bool) -> None:
+        """Write a boolean byte, but only when it actually changed.
+
+        A byte we read as "true" may hold something other than 1 -- these
+        fields are single-bit in our model but not necessarily in the
+        firmware's. Rewriting 0x3D as 0x01 because we decoded it as True would
+        silently discard whatever else that byte encodes, so an unchanged flag
+        leaves the original byte alone.
+        """
+        if bool(self.raw[offset] == 1) != value:
+            buf[offset] = 1 if value else 0
+
 
 # --------------------------------------------------------------------------
 # Parameter0 -- acceleration and assist ratio (0x60/0x10)
@@ -107,7 +120,7 @@ class Parameter0(Block):
     assist_ratio_upper_limit: int = 0
 
     @classmethod
-    def decode(cls, data: bytes) -> "Parameter0":
+    def decode(cls, data: bytes) -> Parameter0:
         if len(data) < BLOCK_LEN:
             raise DecodeError(f"Parameter0 needs {BLOCK_LEN} bytes, got {len(data)}")
         return cls(
@@ -178,6 +191,7 @@ class Parameter1(Block):
     motor_reverse_potential_coefficient: int = 0
     throttle_start_voltage: float = 0.0  # V
     throttle_max_voltage: float = 0.0  # V
+    speed_limit_enabled: int = 0
     start_current: int = 0  # %
     current_loading_time: float = 0.0  # s
     current_shedding_time: float = 0.0  # s
@@ -188,7 +202,7 @@ class Parameter1(Block):
     undervoltage_bytes: list[int] = field(default_factory=list)
 
     @classmethod
-    def decode(cls, data: bytes) -> "Parameter1":
+    def decode(cls, data: bytes) -> Parameter1:
         if len(data) < BLOCK_LEN:
             raise DecodeError(f"Parameter1 needs {BLOCK_LEN} bytes, got {len(data)}")
         return cls(
@@ -219,6 +233,7 @@ class Parameter1(Block):
             motor_reverse_potential_coefficient=_u16(data, 32),
             throttle_start_voltage=data[34] / 10,
             throttle_max_voltage=data[35] / 10,
+            speed_limit_enabled=data[36],
             start_current=data[37],
             current_loading_time=data[38] / 10,
             current_shedding_time=data[39] / 10,
@@ -244,22 +259,23 @@ class Parameter1(Block):
         buf[11] = int(self.limp_mode_soc_limit_stage2)
         buf[12] = int(self.full_capacity_range)
         buf[13] = int(self.pedal_sensor_type)
-        buf[14] = 1 if self.coaster_brake else 0
+        self._put_flag(buf, 14, self.coaster_brake)
         buf[15] = int(self.pedal_sensor_signals_per_rotation)
         buf[16] = int(self.speed_sensor_channel_number)
         buf[20] = int(self.speedmeter_magnets_number)
-        buf[34] = int(round(self.throttle_start_voltage * 10))
-        buf[35] = int(round(self.throttle_max_voltage * 10))
+        buf[34] = round(self.throttle_start_voltage * 10)
+        buf[35] = round(self.throttle_max_voltage * 10)
+        buf[36] = int(self.speed_limit_enabled)
         buf[37] = int(self.start_current)
-        buf[38] = int(round(self.current_loading_time * 10))
-        buf[39] = int(round(self.current_shedding_time * 10))
+        buf[38] = round(self.current_loading_time * 10)
+        buf[39] = round(self.current_shedding_time * 10)
         if len(self.assist_levels) != 9:
             raise DecodeError("Parameter1 needs exactly 9 assist levels")
         for i, level in enumerate(self.assist_levels):
             buf[40 + i] = int(level.current_limit)
             buf[49 + i] = int(level.speed_limit)
-        buf[58] = 1 if self.displayless_mode else 0
-        buf[59] = 1 if self.lamps_always_on else 0
+        self._put_flag(buf, 58, self.displayless_mode)
+        self._put_flag(buf, 59, self.lamps_always_on)
         _put16(buf, 60, self.walk_assist_speed * 100)
         return self._finish(buf)
 
@@ -309,7 +325,7 @@ class Parameter2(Block):
     acceleration_level: int = 0
 
     @classmethod
-    def decode(cls, data: bytes) -> "Parameter2":
+    def decode(cls, data: bytes) -> Parameter2:
         if len(data) < BLOCK_LEN:
             raise DecodeError(f"Parameter2 needs {BLOCK_LEN} bytes, got {len(data)}")
         return cls(
@@ -366,7 +382,7 @@ class SpeedParameters:
         return wheel_by_code(*self.wheel_code)
 
     @classmethod
-    def decode(cls, data: bytes) -> "SpeedParameters":
+    def decode(cls, data: bytes) -> SpeedParameters:
         if len(data) < 6:
             raise DecodeError(f"Speed parameters need 6 bytes, got {len(data)}")
         return cls(
@@ -422,7 +438,7 @@ class ControllerRealtime0:
     remaining_distance: float | None  # km
 
     @classmethod
-    def decode(cls, data: bytes) -> "ControllerRealtime0":
+    def decode(cls, data: bytes) -> ControllerRealtime0:
         if len(data) < 8:
             raise DecodeError("ControllerRealtime0 needs 8 bytes")
         remaining = _u16(data, 6)
@@ -444,7 +460,7 @@ class ControllerRealtime1:
     motor_temperature: int | None  # degC
 
     @classmethod
-    def decode(cls, data: bytes) -> "ControllerRealtime1":
+    def decode(cls, data: bytes) -> ControllerRealtime1:
         if len(data) < 8:
             raise DecodeError("ControllerRealtime1 needs 8 bytes")
         return cls(
@@ -462,7 +478,7 @@ class SensorRealtime:
     cadence: int  # rpm
 
     @classmethod
-    def decode(cls, data: bytes) -> "SensorRealtime":
+    def decode(cls, data: bytes) -> SensorRealtime:
         if len(data) < 3:
             raise DecodeError("SensorRealtime needs 3 bytes")
         return cls(torque=_u16(data, 0), cadence=data[2])
@@ -477,7 +493,7 @@ class BatteryCapacity:
     soh: int  # %
 
     @classmethod
-    def decode(cls, data: bytes) -> "BatteryCapacity":
+    def decode(cls, data: bytes) -> BatteryCapacity:
         if len(data) < 7:
             raise DecodeError("BatteryCapacity needs 7 bytes")
         return cls(
@@ -496,7 +512,7 @@ class BatteryState:
     temperature: int  # degC
 
     @classmethod
-    def decode(cls, data: bytes) -> "BatteryState":
+    def decode(cls, data: bytes) -> BatteryState:
         if len(data) < 5:
             raise DecodeError("BatteryState needs 5 bytes")
         return cls(
@@ -513,7 +529,7 @@ class DisplayData1:
     max_speed: float  # km/h
 
     @classmethod
-    def decode(cls, data: bytes) -> "DisplayData1":
+    def decode(cls, data: bytes) -> DisplayData1:
         if len(data) < 8:
             raise DecodeError("DisplayData1 needs 8 bytes")
         return cls(
@@ -529,7 +545,7 @@ class DisplayData2:
     service_mileage: float  # km
 
     @classmethod
-    def decode(cls, data: bytes) -> "DisplayData2":
+    def decode(cls, data: bytes) -> DisplayData2:
         if len(data) < 5:
             raise DecodeError("DisplayData2 needs 5 bytes")
         return cls(average_speed=_u16(data, 0) / 10, service_mileage=_u24(data, 2) / 10)

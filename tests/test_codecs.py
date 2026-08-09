@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from bafang_can import codecs
@@ -137,3 +139,27 @@ def test_battery_state_handles_negative_current():
 def test_error_codes_are_ascii_pairs():
     assert codecs.decode_error_codes(b"0821\x00") == [8, 21]
     assert codecs.decode_error_codes(b"\x00") == []
+
+
+@pytest.mark.parametrize("cls", [codecs.Parameter0, codecs.Parameter1, codecs.Parameter2])
+def test_decode_encode_is_the_identity_on_random_blocks(cls):
+    """A block read from a device and written straight back must not change.
+
+    This is the invariant that protects the undecoded bytes: if any field
+    scales badly on the way out (or an offset is wrong in one direction only),
+    a random block will not survive the round trip.
+    """
+    rng = random.Random(4242)
+    for _ in range(200):
+        body = bytes(rng.randrange(256) for _ in range(63))
+        raw = body + bytes([checksum(body)])
+        block = cls.decode(raw)
+        assert block.checksum_ok
+        assert block.encode() == raw, cls.__name__
+
+
+def test_speed_parameters_round_trip_on_random_payloads():
+    rng = random.Random(99)
+    for _ in range(200):
+        raw = bytes(rng.randrange(256) for _ in range(6))
+        assert codecs.SpeedParameters.decode(raw).encode() == raw

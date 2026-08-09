@@ -71,3 +71,33 @@ If `scan` finds nothing:
 4. Run `bafang-can sniff --passive` — if the display and drive unit are
    talking to each other you will see traffic even when nothing answers you,
    which proves the wiring and bit rate are right and points at addressing.
+
+## The day the adapter arrives
+
+Before touching the bike, confirm the host sees the adapter and the tool can
+open it:
+
+```bash
+bafang-can adapters
+```
+
+If it reports a gs_usb device, the firmware is candleLight(-FD) and the
+default `--interface gs_usb` is right. If it reports a serial port instead,
+the board carries slcan firmware: add `--interface slcan --channel <port>` to
+every command below.
+
+Then, in this order:
+
+1. `bafang-can sniff --passive --seconds 10` on the powered-on bike. Frames
+   appearing proves wiring, polarity and bit rate before you transmit anything.
+2. `bafang-can scan` — which nodes answer the tool.
+3. `bafang-can probe` — which commands this firmware actually implements.
+   Save the output; it is the map for everything after.
+4. `bafang-can dump -o baseline-$(date +%F).json` — back up before any write.
+5. `bafang-can diagnose` — the read-only health report.
+
+Only then start changing things, one field at a time, per
+[m200.md](m200.md).
+
+If long writes are refused but short ones work, raise the inter-frame gap:
+`--write-delay 0.05`.

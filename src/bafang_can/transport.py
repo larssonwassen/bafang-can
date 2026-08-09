@@ -19,8 +19,9 @@ are on a bench harness with no other terminator.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .constants import BITRATE
 
@@ -114,6 +115,12 @@ def list_gs_usb_devices() -> list[str]:
 
 def open_bus(config: AdapterConfig):
     """Open a python-can bus, raising a readable error if that is not possible."""
+    if config.interface == "sim":
+        from .simulator import SimBus
+
+        extra = config.extra or {}
+        return SimBus(**extra)
+
     try:
         import can  # type: ignore import-not-found
     except ImportError as exc:  # pragma: no cover - dependency check

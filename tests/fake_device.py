@@ -20,7 +20,7 @@ class FakeBus:
 
     def __init__(self, blocks: dict[tuple[int, int], bytes] | None = None) -> None:
         self.blocks = blocks or {}
-        self.rx: "queue.Queue[can.Message]" = queue.Queue()
+        self.rx: queue.Queue[can.Message] = queue.Queue()
         self.sent: list[can.Message] = []
         self.written: dict[tuple[int, int], bytearray] = {}
         self._pending_write: tuple[int, int] | None = None

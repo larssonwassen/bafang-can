@@ -17,8 +17,8 @@ is left to the transport layer, so only the 29 bits are handled.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 from .constants import CanOperation, DeviceId
 
@@ -47,7 +47,7 @@ class BafangId:
     subcode: int
 
     @classmethod
-    def decode(cls, can_id: int) -> "BafangId":
+    def decode(cls, can_id: int) -> BafangId:
         can_id &= CAN_EFF_MASK
         return cls(
             source=(can_id >> 24) & 0x1F,

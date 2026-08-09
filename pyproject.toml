@@ -27,3 +27,16 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+# ISC004: long human-readable strings are split across lines on purpose.
+ignore = ["E501", "ISC004"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately poke at internals and build odd payloads.
+"tests/*" = ["B011"]

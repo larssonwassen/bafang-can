@@ -56,7 +56,7 @@ class DeviceError(BafangError):
 
 @dataclass
 class _Pending:
-    queue: "queue.Queue[BafangMessage]"
+    queue: queue.Queue[BafangMessage]
 
 
 @dataclass
@@ -82,11 +82,13 @@ class BafangClient:
         source: int = DeviceId.TOOL,
         timeout: float = DEFAULT_TIMEOUT,
         send_acks: bool = True,
+        interframe_delay: float = INTERFRAME_DELAY,
     ) -> None:
         self.bus = bus
         self.source = int(source)
         self.timeout = timeout
         self.send_acks = send_acks
+        self.interframe_delay = interframe_delay
 
         self._pending: dict[tuple[int, int, int], _Pending] = {}
         self._buffers: dict[tuple[int, int, int], _MultiframeBuffer] = {}
@@ -97,7 +99,7 @@ class BafangClient:
 
     # -- lifecycle ------------------------------------------------------
 
-    def start(self) -> "BafangClient":
+    def start(self) -> BafangClient:
         if self._rx_thread is not None:
             return self
         self._stop.clear()
@@ -120,7 +122,7 @@ class BafangClient:
         except Exception:  # pragma: no cover - driver dependent
             log.debug("bus shutdown raised", exc_info=True)
 
-    def __enter__(self) -> "BafangClient":
+    def __enter__(self) -> BafangClient:
         return self.start()
 
     def __exit__(self, *exc_info) -> None:
@@ -157,6 +159,11 @@ class BafangClient:
                 self._expire_buffers()
                 continue
             if not message.is_extended_id or message.is_error_frame:
+                continue
+            # gs_usb echoes our own transmissions back with is_rx False. The
+            # source check in _handle catches them too, but only while we are
+            # impersonating the BESST tool id.
+            if getattr(message, "is_rx", True) is False:
                 continue
             self._handle(message)
 
@@ -360,10 +367,11 @@ class BafangClient:
         command: Command,
         data: bytes,
         timeout: float | None = None,
-        delay: float = INTERFRAME_DELAY,
+        delay: float | None = None,
     ) -> BafangMessage:
         """Multi-frame write; returns the device's acknowledgement."""
         timeout = self.timeout if timeout is None else timeout
+        delay = self.interframe_delay if delay is None else delay
         what = f"write {command.name} ({command.code:#04x}/{command.subcode:#04x})"
         key = (int(target), command.code, command.subcode)
         pending = self._register(key)
