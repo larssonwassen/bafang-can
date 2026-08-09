@@ -13,13 +13,16 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import codecs
 from .commands import READ, WRITE, Command
 from .constants import DeviceId, error_text
 from .frame import BafangMessage, string_from_bytes, string_to_bytes
 from .protocol import BafangClient, BafangError
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
+    from . import capture as capture_module
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +214,44 @@ class BafangSystem:
         if not command.applies_to(device):
             raise ValueError(f"{name} cannot be written to {device.name}")
         return self.client.write(device, command, bytes(string_to_bytes(value)))
+
+    # -- recording a device profile ------------------------------------------
+
+    def capture(
+        self,
+        devices: Iterable[DeviceId] | None = None,
+        timeout: float = 0.8,
+    ) -> capture_module.DeviceProfile:
+        """Record every answer this bike gives, as raw bytes.
+
+        Unlike :meth:`dump`, nothing is interpreted: the payloads are stored
+        exactly as they arrived. That makes the result usable as a replay
+        source for the simulator, and as evidence when a field turns out to
+        mean something different on this motor than the block layouts assume.
+        """
+        from . import capture as capture_module
+
+        profile = capture_module.DeviceProfile(source="live capture")
+        devices = devices or (
+            DeviceId.DRIVE_UNIT,
+            DeviceId.DISPLAY,
+            DeviceId.TORQUE_SENSOR,
+            DeviceId.BATTERY,
+        )
+        for device in devices:
+            for name, command in READ.items():
+                if not command.applies_to(device) or name.startswith("FwUpdate"):
+                    continue
+                try:
+                    message = self.client.read(
+                        device, command, timeout=timeout, retries=0
+                    )
+                except BafangError:
+                    continue
+                profile.record(
+                    int(device), command.code, command.subcode, message.data
+                )
+        return profile
 
     # -- backup / restore ---------------------------------------------------
 

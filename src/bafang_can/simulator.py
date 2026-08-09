@@ -184,6 +184,7 @@ class SimBus:
         seed: int | None = 0,
         chatter: bool = True,
         state_path: str | None = None,
+        profile: str | None = None,
     ) -> None:
         self.rx: queue.Queue = queue.Queue()
         self.sent: list = []
@@ -195,6 +196,10 @@ class SimBus:
         self._pending_write: tuple[int, int, int] | None = None
         self._write_buffer = bytearray()
         self._build()
+        self.profile_source = ""
+        self.profile_responses: set[tuple[int, int, int]] = set()
+        if profile:
+            self._load_profile(profile)
         self.state_path = Path(state_path) if state_path else None
         self._load_state()
         self._stop = threading.Event()
@@ -204,6 +209,27 @@ class SimBus:
                 target=self._chatter_loop, name="sim-chatter", daemon=True
             )
             self._chatter.start()
+
+    # -- recorded device profiles -------------------------------------------
+
+    def _load_profile(self, path: str) -> None:
+        """Replace the invented answers with ones a real bike gave.
+
+        Anything the profile does not cover keeps its invented default, so a
+        partial capture is still useful. ``profile_responses`` records which
+        keys are real, so callers can tell the two apart instead of guessing.
+        """
+        from .capture import DeviceProfile
+
+        loaded = DeviceProfile.load(path)
+        for key, payload in loaded.blocks().items():
+            self.blocks[key] = payload
+            self.profile_responses.add(key)
+        self.profile_source = loaded.source or str(path)
+
+    def is_recorded(self, device: int, code: int, subcode: int) -> bool:
+        """True when this answer came from a real bike rather than a default."""
+        return (int(device), code, subcode) in self.profile_responses
 
     # -- optional persistence ----------------------------------------------
 
@@ -422,9 +448,16 @@ class SimBus:
         time.sleep(LATENCY)
 
         if ident.operation == CanOperation.READ_CMD:
-            payload = self._dynamic(key)
-            if payload is None:
+            if key in self.profile_responses:
+                # A recorded answer always wins over a synthesized one, even
+                # for live data. That means telemetry replayed from a profile
+                # is frozen at the captured value; drop --sim-profile if you
+                # want the moving numbers back.
                 payload = self.blocks.get(key)
+            else:
+                payload = self._dynamic(key)
+                if payload is None:
+                    payload = self.blocks.get(key)
             if payload is None:
                 self._emit(target, CanOperation.ERROR_ACK, ident.code, ident.subcode, b"\x00")
                 return

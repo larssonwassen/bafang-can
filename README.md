@@ -54,7 +54,17 @@ bafang-can monitor                  # live speed/voltage/current/torque/cadence
 bafang-can sniff --passive          # decode traffic without transmitting
 bafang-can errors                   # stored fault codes with descriptions
 bafang-can dump -o baseline.json    # full configuration backup
+bafang-can sniff -o ride.log        # record the bus to a candump log
 bafang-can decode-log ride.log      # decode a recorded capture offline
+```
+
+Recording your bike so the simulator replays it instead of invented values
+(see [docs/profiles.md](docs/profiles.md)):
+
+```bash
+bafang-can capture -o m200.json --anonymize    # ask the bike everything
+bafang-can import-capture ride.log -o m200.json  # or rebuild it from a sniff
+bafang-can --interface sim --sim-profile m200.json diagnose
 ```
 
 Changing things — every write is a dry run until `--apply`:
@@ -98,8 +108,9 @@ src/bafang_can/
   system.py       high-level device access, dump and restore
   profiles/m200.py  M200 (G210) limits and diagnostic checklist
   simulator.py    a simulated bike, for working without hardware
+  capture.py      recording a real bike into a replayable device profile
   cli.py          the command line interface
-docs/             protocol notes, hardware setup, M200 workflow, testing
+docs/             protocol, hardware, M200 workflow, testing, device profiles
 vendor/           the two upstream projects, as submodules
 tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 ```

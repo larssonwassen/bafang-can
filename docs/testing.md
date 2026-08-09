@@ -87,9 +87,13 @@ JavaScript is an oracle written by someone else, from someone else's reading
 of the protocol. Layer 4 covers wiring and CLI behaviour; it does not
 establish that the byte layouts are right.
 
-Replacing the invented values with a recorded capture from a real bike would
-be a strict improvement. `bafang-can sniff` plus `decode-log` is how to make
-one once the adapter arrives.
+Replacing the invented values with a recorded capture is a strict improvement,
+and the machinery for it is in place: `bafang-can capture` records every
+answer a real bike gives, `import-capture` rebuilds the same thing from a
+sniff log, and `--sim-profile` makes the simulator answer from it. See
+[profiles.md](profiles.md). Until such a capture exists the defaults stay
+labelled as invented, because a plausible guess presented as a measurement is
+worse than an obvious guess.
 
 ## What this does *not* prove
 

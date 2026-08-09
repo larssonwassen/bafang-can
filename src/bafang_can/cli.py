@@ -82,6 +82,7 @@ def _connect(args) -> tuple[BafangClient, BafangSystem]:
             else None,
             "pedalling": not args.sim_idle,
             "state_path": args.sim_state,
+            "profile": args.sim_profile,
         }
         extra = {k: v for k, v in extra.items() if v is not None}
     config = AdapterConfig(
@@ -267,6 +268,14 @@ def cmd_monitor(args) -> int:
 
 def cmd_sniff(args) -> int:
     client, _ = _connect(args)
+    writer = None
+    if args.output:
+        import can
+
+        # Written in candump format, which decode-log and import-capture read
+        # back, and which every other CAN tool understands.
+        writer = can.CanutilsLogWriter(args.output, channel="can0")
+        client.bus = _TappedBus(client.bus, writer)
     try:
         def on_message(message) -> None:
             print(
@@ -275,7 +284,8 @@ def cmd_sniff(args) -> int:
                 + ("  (multiframe)" if message.multiframe else "")
             )
 
-        client.add_listener(on_message)
+        if not args.quiet:
+            client.add_listener(on_message)
         client.send_acks = not args.passive
         end = time.monotonic() + args.seconds if args.seconds else None
         while end is None or time.monotonic() < end:
@@ -285,6 +295,37 @@ def cmd_sniff(args) -> int:
         return 0
     finally:
         client.close()
+        if writer is not None:
+            writer.stop()
+            print(f"\nWrote {args.output}")
+            print(
+                f"Turn it into a simulator profile with: "
+                f"bafang-can import-capture {args.output} -o profile.json"
+            )
+
+
+class _TappedBus:
+    """Wraps a bus so every frame that passes is also written to a log."""
+
+    def __init__(self, bus, writer) -> None:
+        self._bus = bus
+        self._writer = writer
+
+    def recv(self, timeout=None):
+        message = self._bus.recv(timeout=timeout)
+        if message is not None:
+            self._writer.on_message_received(message)
+        return message
+
+    def send(self, message, timeout=None):
+        self._writer.on_message_received(message)
+        return self._bus.send(message, timeout) if timeout else self._bus.send(message)
+
+    def shutdown(self):
+        return self._bus.shutdown()
+
+    def __getattr__(self, name):
+        return getattr(self._bus, name)
 
 
 def cmd_errors(args) -> int:
@@ -601,6 +642,65 @@ def cmd_commands(args) -> int:
     return 0
 
 
+def cmd_capture(args) -> int:
+    """Record every answer the bike gives, as raw bytes."""
+    client, system = _connect(args)
+    try:
+        profile = system.capture(timeout=args.command_timeout)
+        if args.note:
+            profile.note = args.note
+        if args.anonymize:
+            profile.anonymize()
+        profile.save(args.output)
+        summary = profile.summary()
+        print(f"Recorded {summary['responses']} answers to {args.output}")
+        _print(summary["devices"], args.json)
+        if not args.anonymize:
+            print(
+                "\nThis profile contains the serial numbers of your bike. "
+                "Re-run with --anonymize before sharing it."
+            )
+        print(
+            "\nReplay it with: "
+            f"bafang-can --interface sim --sim-profile {args.output} diagnose"
+        )
+        return 0
+    finally:
+        client.close()
+
+
+def cmd_import_capture(args) -> int:
+    """Build a device profile from a recorded sniff, offline."""
+    from .capture import profile_from_log
+
+    profile = profile_from_log(args.file)
+    if args.note:
+        profile.note = args.note
+    if args.anonymize:
+        profile.anonymize()
+    if not profile.responses:
+        print(
+            f"No complete answers found in {args.file}. A passive capture only "
+            "yields answers that a device actually sent while recording; try "
+            "'capture' against the bike instead."
+        )
+        return 2
+    profile.save(args.output)
+    summary = profile.summary()
+    print(f"Recovered {summary['responses']} answers from {args.file}")
+    _print(summary["devices"], args.json)
+    return 0
+
+
+def cmd_profile(args) -> int:
+    """Show what is inside a device profile."""
+    from .capture import DeviceProfile
+
+    profile = DeviceProfile.load(args.file)
+    _print(profile.summary(), args.json)
+    return 0
+
+
 def cmd_decode(args) -> int:
     """Decode a CAN identifier without touching hardware."""
     ident = BafangId.decode(int(args.can_id, 0))
@@ -730,6 +830,13 @@ def _add_global_options(parser: argparse.ArgumentParser, defaults: bool) -> None
         help="with --interface sim: bike standing still instead of being ridden",
     )
     parser.add_argument(
+        "--sim-profile",
+        default=default(None),
+        help="with --interface sim: a device profile recorded from a real "
+        "bike (see 'capture' and 'import-capture'), used instead of the "
+        "invented default answers",
+    )
+    parser.add_argument(
         "--sim-state",
         default=default(None),
         help="with --interface sim: JSON file keeping the simulated bike's "
@@ -777,6 +884,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("sniff", help="decode every frame on the bus")
     p.add_argument("--seconds", type=float, default=0)
     p.add_argument("--passive", action="store_true", help="never transmit, not even ACKs")
+    p.add_argument("-o", "--output", help="also record to a candump log")
+    p.add_argument("--quiet", action="store_true", help="record without printing")
     p.set_defaults(func=cmd_sniff)
 
     p = add("errors", help="read (and optionally clear) stored error codes")
@@ -827,6 +936,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_raw)
 
     add("commands", help="print the known command tables").set_defaults(func=cmd_commands)
+
+    p = add(
+        "capture",
+        help="record every answer the bike gives, for replay in the simulator",
+    )
+    p.add_argument("-o", "--output", default="profile.json")
+    p.add_argument("--anonymize", action="store_true", help="blank serial numbers")
+    p.add_argument("--note", help="free text stored in the profile")
+    p.add_argument(
+        "--command-timeout",
+        type=float,
+        default=0.8,
+        help="per-command timeout while probing (default: 0.8)",
+    )
+    p.set_defaults(func=cmd_capture)
+
+    p = add(
+        "import-capture",
+        help="build a device profile from a recorded sniff (offline)",
+    )
+    p.add_argument("file")
+    p.add_argument("-o", "--output", default="profile.json")
+    p.add_argument("--anonymize", action="store_true", help="blank serial numbers")
+    p.add_argument("--note", help="free text stored in the profile")
+    p.set_defaults(func=cmd_import_capture)
+
+    p = add("profile", help="show what a device profile contains")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_profile)
 
     p = add("decode", help="decode a 29-bit Bafang CAN id (offline)")
     p.add_argument("can_id")

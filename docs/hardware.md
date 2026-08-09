@@ -118,7 +118,10 @@ Then, in this order:
 3. `bafang-can probe` — which commands this firmware actually implements.
    Save the output; it is the map for everything after.
 4. `bafang-can dump -o baseline-$(date +%F).json` — back up before any write.
-5. `bafang-can diagnose` — the read-only health report.
+5. `bafang-can capture -o m200-profile.json --anonymize` — record every answer
+   the bike gives, so the simulator can replay your motor instead of the
+   invented defaults. See [profiles.md](profiles.md).
+6. `bafang-can diagnose` — the read-only health report.
 
 Only then start changing things, one field at a time, per
 [m200.md](m200.md).
