@@ -117,7 +117,7 @@ tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 
 ## Validation
 
-Run `pytest` (67 tests, ~25 s). Four layers, described in
+Run `pytest` (90 tests, ~26 s). Five layers, described in
 [docs/testing.md](docs/testing.md):
 
 1. Unit tests for identifiers, checksums, offsets and scaling.
@@ -129,6 +129,8 @@ Run `pytest` (67 tests, ~25 s). Four layers, described in
    this tool emits are byte-identical to the vendor serializer's. This also
    found a missing field (`speed_limit_enabled`, Parameter1 byte 36).
 4. End-to-end CLI tests against the built-in simulator.
+5. Bench tests on a real adapter with no bike attached, which settled how the
+   firmware is identified and made `sniff --passive` genuinely passive.
 
 ## Status and honesty about the M200
 

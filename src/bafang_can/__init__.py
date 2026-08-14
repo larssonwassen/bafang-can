@@ -8,11 +8,12 @@ from .constants import CanOperation, DeviceId
 from .frame import BafangId, BafangMessage
 from .protocol import BafangClient, BafangError, DeviceError, TimeoutError_
 from .system import BafangSystem
-from .transport import AdapterConfig, open_bus
+from .transport import Adapter, AdapterConfig, find_adapters, open_bus
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "Adapter",
     "AdapterConfig",
     "BafangClient",
     "BafangError",
@@ -23,5 +24,6 @@ __all__ = [
     "DeviceError",
     "DeviceId",
     "TimeoutError_",
+    "find_adapters",
     "open_bus",
 ]

@@ -22,7 +22,7 @@ from .frame import BafangId
 from .profiles import m200
 from .protocol import BafangClient, BafangError
 from .system import BafangSystem
-from .transport import AdapterConfig, describe_adapters, open_bus
+from .transport import AdapterConfig, find_adapters, open_bus
 
 log = logging.getLogger("bafang_can")
 
@@ -73,7 +73,7 @@ def _print_human(value: Any, indent: int = 0) -> None:
         print(f"{pad}{value}")
 
 
-def _connect(args) -> tuple[BafangClient, BafangSystem]:
+def _connect(args, *, listen_only: bool = False) -> tuple[BafangClient, BafangSystem]:
     extra: dict[str, Any] | None = None
     if args.interface == "sim":
         extra = {
@@ -90,6 +90,7 @@ def _connect(args) -> tuple[BafangClient, BafangSystem]:
         channel=args.channel,
         bitrate=args.bitrate,
         index=args.index,
+        listen_only=listen_only,
         extra=extra,
     )
     bus = open_bus(config)
@@ -122,21 +123,26 @@ def _confirm(args, what: str) -> bool:
 
 
 def cmd_adapters(args) -> int:
-    lines = list(describe_adapters())
-    found = [line for line in lines if "cannot enumerate" not in line]
-    for line in lines:
-        if line not in found:
-            print(line)
-    if not found:
-        print("No CAN adapter found.")
+    adapters = find_adapters()
+    usable = [a for a in adapters if a.problem is None]
+    if args.json:
+        _print([dataclasses.asdict(a) for a in adapters], True)
+        return 0 if usable else 1
+    for adapter in adapters:
+        if adapter.problem:
+            print(f"{adapter.interface}: {adapter.description} -- {adapter.problem}")
+        else:
+            print(f"{adapter.interface}: {adapter.description}")
+            print(f"    open with: bafang-can {adapter.command_hint()} scan")
+    if not usable:
+        print("No usable CAN adapter found.")
         print(
-            "CANable Pro 2.0 with candleLight-FD firmware appears as a gs_usb "
-            "device; with slcan firmware it appears as a serial port."
+            "A CANable-class board appears as a gs_usb device when it carries "
+            "candleLight-FD firmware, and as a serial port when it carries "
+            "slcan firmware. Its USB id does not tell you which."
         )
         print("macOS needs libusb for gs_usb: brew install libusb")
         return 1
-    for line in found:
-        print(line)
     return 0
 
 
@@ -267,7 +273,10 @@ def cmd_monitor(args) -> int:
 
 
 def cmd_sniff(args) -> int:
-    client, _ = _connect(args)
+    # --passive has to reach the CAN controller, not just the protocol layer:
+    # in normal mode the controller drives the dominant ACK bit for every
+    # frame it receives, which is a transmission onto the bike's bus.
+    client, _ = _connect(args, listen_only=args.passive)
     writer = None
     if args.output:
         import can
@@ -883,7 +892,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("sniff", help="decode every frame on the bus")
     p.add_argument("--seconds", type=float, default=0)
-    p.add_argument("--passive", action="store_true", help="never transmit, not even ACKs")
+    p.add_argument(
+        "--passive",
+        action="store_true",
+        help="listen-only: the adapter never drives the bus, not even the "
+        "CAN ACK bit",
+    )
     p.add_argument("-o", "--output", help="also record to a candump log")
     p.add_argument("--quiet", action="store_true", help="record without printing")
     p.set_defaults(func=cmd_sniff)

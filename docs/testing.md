@@ -95,10 +95,39 @@ sniff log, and `--sim-profile` makes the simulator answer from it. See
 labelled as invented, because a plausible guess presented as a measurement is
 worse than an obvious guess.
 
+## 5. On the adapter, with no bike attached
+
+An adapter on the bench, with nothing wired to CAN-H/CAN-L, still settles
+everything on the host side of the transceiver. Run against an Openlight Labs
+CANable2 (`16d0:117e`, slcan firmware):
+
+| what | result |
+| --- | --- |
+| `adapters` classifies the firmware | slcan, from CDC interface classes and an empty `GsUsb.scan()` |
+| open at 250 kbit/s | ok; slcan sends `S5` |
+| open listen-only | ok; slcan sends `L` instead of `O` |
+| `scan` with nothing on the bus | every node `-`, exit 2, clean timeout, no hang |
+| `sniff --passive --seconds 3` | exit 0 |
+| close and reopen the port | ok |
+
+`tests/test_transport.py` pins the classification and the listen-only plumbing
+with fake USB devices, so neither needs hardware to stay fixed.
+
+This found two defects. `adapters` reported a gs_usb device that did not
+exist, because it matched USB vendor/product ids against a list instead of
+asking whether anything could open the device — and `16d0:117e` is used for
+both firmwares. And `--passive` only suppressed protocol-level ACK frames; the
+CAN controller was still in normal mode, driving the dominant ACK bit for
+every frame it received. The first thing [hardware.md](hardware.md) tells you
+to run on a powered bike was therefore transmitting onto its bus.
+
 ## What this does *not* prove
 
-* That the CANable Pro 2.0 enumerates and passes traffic — that needs the
-  adapter. `bafang-can adapters` is the first check when it arrives.
+* That the transmit path is correct. Sending into a dead bus tells you
+  nothing: slcan's `send()` just writes ASCII to the serial port and never
+  reports the missing acknowledgement. A gs_usb board could be put in
+  `GS_CAN_MODE_LOOP_BACK` and checked against itself; an slcan board cannot,
+  so on one of those this waits for the bike.
 * That an M200 (G210) lays its parameter blocks out the way the M500/M600
   generation does. `bafang-can probe` and the workflow in
   [m200.md](m200.md) exist for exactly that reason.

@@ -2,16 +2,32 @@
 
 ## The adapter
 
-The CANable Pro 2.0 is an STM32G431 with a galvanically isolated transceiver.
-It ships with **candleLight-FD** firmware, which speaks the `gs_usb` USB
-protocol — that is what `--interface gs_usb` (the default) uses. If your board
-has been reflashed to the **slcan/CANtact** firmware it enumerates as a USB CDC
-serial port instead; use `--interface slcan --channel /dev/tty.usbmodemXXXX`.
+The CANable Pro 2.0 / CANable2 is an STM32G431 with a galvanically isolated
+transceiver. Which USB protocol it speaks depends on the firmware image
+flashed on it, and different vendors ship different images on the same board:
+
+* **candleLight-FD** speaks the `gs_usb` USB protocol over a vendor-specific
+  interface — `--interface gs_usb`, the default.
+* **slcan** enumerates as a USB CDC ACM serial port —
+  `--interface slcan --channel /dev/tty.usbmodemXXXX`.
+
+**The USB vendor/product id does not tell you which.** A verified example: an
+Openlight Labs CANable2 reporting `16d0:117e` — an id other batches use for
+gs_usb boards — carries the slcan image from
+`github.com/normaldotcom/canable2.git`. Its USB config has two CDC interfaces
+(classes `0x02` and `0x0a`) and no vendor-specific one, and `GsUsb.scan()`
+does not see it at all. So run `bafang-can adapters` and use the command it
+prints, rather than assuming from the product name:
+
+```
+slcan: CANable2 b158aa7 github.com/normaldotcom/canable2.git
+    open with: bafang-can --interface slcan --channel /dev/cu.usbmodemXXXXX scan
+```
 
 Note that the older `bafang_canable_pro` README asks for an STM32F072-based
-CANable v1 with candlelight firmware. The Pro 2.0 works with this tool because
-both firmwares expose the same gs_usb interface; the Bafang bus is classic CAN
-at 250 kbit/s, so the FD capability of the Pro 2.0 is not used.
+CANable v1 with candlelight firmware. The Pro 2.0 works with this tool on
+either firmware; the Bafang bus is classic CAN at 250 kbit/s, so the FD
+capability of the Pro 2.0 is not used.
 
 ### Which firmware, and why it matters
 
@@ -34,8 +50,15 @@ could flash instead.
 For a Bafang bus -- 250 kbit/s, request/response, low volume -- slcan is
 entirely adequate. gs_usb is the better choice for sniffing a busy bus, and on
 Linux it gives you SocketCAN, which means `candump` captures that feed
-straight into `bafang-can decode-log`. It is also what the Pro 2.0 ships with,
-so it is the default here purely to avoid making you flash anything.
+straight into `bafang-can decode-log`. It is the default here only because it
+is the more common factory image; if your board carries slcan, as the one
+tested here does, there is no reason to reflash it.
+
+One thing only gs_usb gives you: `GS_CAN_MODE_LOOP_BACK`, an internal loopback
+where transmitted frames come straight back with no bus and no second node to
+acknowledge them. That is the only way to test the transmit path before the
+bike harness exists. slcan has no equivalent, so on an slcan board the
+transmit path stays unproven until you are wired to the bike.
 
 ## Host prerequisites
 
@@ -105,15 +128,18 @@ open it:
 bafang-can adapters
 ```
 
-If it reports a gs_usb device, the firmware is candleLight(-FD) and the
-default `--interface gs_usb` is right. If it reports a serial port instead,
-the board carries slcan firmware: add `--interface slcan --channel <port>` to
-every command below.
+It prints the exact `--interface`/`--channel` arguments that open what it
+found; use those on every command below. It classifies by what the device
+actually exposes, not by its USB id, so `gs_usb:` means the gs_usb backend can
+really open it and `slcan:` means the board carries the serial firmware.
 
 Then, in this order:
 
 1. `bafang-can sniff --passive --seconds 10` on the powered-on bike. Frames
    appearing proves wiring, polarity and bit rate before you transmit anything.
+   `--passive` puts the CAN controller in listen-only mode, so the adapter
+   cannot drive the bus at all — not even the dominant ACK bit that a
+   normal-mode controller sends for every frame it hears.
 2. `bafang-can scan` — which nodes answer the tool.
 3. `bafang-can probe` — which commands this firmware actually implements.
    Save the output; it is the map for everything after.
