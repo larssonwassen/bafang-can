@@ -29,6 +29,46 @@ CANable v1 with candlelight firmware. The Pro 2.0 works with this tool on
 either firmware; the Bafang bus is classic CAN at 250 kbit/s, so the FD
 capability of the Pro 2.0 is not used.
 
+### Expect an STM32G431 board to be running slcan
+
+`--interface gs_usb` is this tool's default, but on a G431 board slcan is the
+more likely firmware, for a reason worth knowing before you plan around it:
+
+* [`candle-usb/candleLight_fw`](https://github.com/candle-usb/candleLight_fw),
+  the upstream gs_usb firmware, does not support the part. Its own README:
+  "STM32G431-based devices (e.g. CANable-MKS 2.0) are not supported by this
+  project yet." Its prebuilt binaries are F042/F072 and STM32G0B1.
+* [`normaldotcom/canable2`](https://github.com/normaldotcom/canable2), the
+  firmware Openlight Labs boards ship with, is slcan only. It builds no
+  candleLight variant, so the vendor image cannot give you gs_usb either.
+
+The only gs_usb firmware for a G431 that this project is aware of is the
+third-party HUD ECU Hacker build (`STM32G431-Candlelight2.5-Multiboard.dfu`)
+from [netcult.ch](https://www.netcult.ch/elmue/CANable%20Firmware%20Update/),
+which is what the vendored `bafang_canable_pro` README recommends. Single
+source; weigh that before reflashing.
+
+### Reflashing to gs_usb
+
+Worth doing if you need listen-only that works (see below) or a transmit
+self-test; not worth doing just to use the default interface.
+
+1. Fit the BOOT jumper, or hold the BOOT button, and plug in USB. BOOT0 is
+   sampled only at reset, so the jumper can stay fitted through the flash.
+2. Confirm the ROM bootloader took over: `dfu-util -l` should list
+   `[0483:df11]` with `alt=0 @Internal Flash /0x08000000/64*02Kg`.
+3. `dfu-util -w -c 1 -i 0 -a 0 -D STM32G431-Candlelight2.5-Multiboard.dfu`
+4. Unplug, **remove the jumper**, plug back in, and check with
+   `bafang-can adapters` that a `gs_usb:` line replaced the `slcan:` one.
+
+Only ever write `-a 0`. `alt=1` is the option bytes, where read-out protection
+lives -- setting RDP level 2 there is irreversible, unlike a bad application
+image, which the BOOT jumper always recovers. `alt=2` is one-time programmable.
+Neither is part of a firmware update.
+
+Backing out costs nothing: entering the bootloader does not modify flash, so
+unplug, remove the jumper and replug returns the board to the image it had.
+
 ### Which firmware, and why it matters
 
 candleLight and gs_usb are not alternatives: candleLight is the firmware on
