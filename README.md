@@ -148,10 +148,17 @@ node. Two findings matter for anyone pointing this at similar hardware:
   parameter block, no realtime read, no stored error code, from any source id.
   It does however **broadcast** the realtime data it will not answer, which is
   what `monitor --passive` reads.
-* Its `ControllerRealtime1` layout **differs** from the M500/M600 generation:
-  it decoded 51.5 V while the battery independently reported 37.47 V on a 36 V
-  pack. `monitor --passive` cross-checks the two and warns rather than
-  presenting the number. `ControllerRealtime0` passed the same kind of check.
+* Its `ControllerRealtime1` voltage field read **51.0 V while the battery
+  independently reported 37.4 V** on a 36 V pack. Varying the supply settled
+  why: the field tracks real voltage but is scaled **1.363× high**, which made
+  that drive unit trip its (perfectly sensible) 47 V overvoltage threshold at
+  34.5 V of actual pack, disabling assist permanently. The codecs were right
+  and the hardware was faulty — see [docs/m200.md](docs/m200.md) for the
+  method, which is a useful diagnostic in its own right.
+  `monitor --passive` reports the disagreement rather than presenting either
+  number as fact, and that warning is what led to the diagnosis.
+  `ControllerRealtime0` passed the equivalent check, its torque field agreeing
+  with the torque sensor's own broadcast to within four counts.
 
 ## Status and honesty about the M200
 

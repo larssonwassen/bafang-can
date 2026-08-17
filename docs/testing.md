@@ -190,6 +190,25 @@ mode control transfer alone does it in place. The unit test that covered this
 used a fake whose `start()` did nothing, so it passed against code that could
 not work on hardware. The fake now raises if `start()` is called.
 
+## 8. The gs_usb transport, on the bike
+
+With the adapter reflashed to candleLight and the bike connected, the things
+slcan could not do were checked against real traffic:
+
+* **Listen-only receives.** `sniff --passive` decodes the full bus while
+  transmitting nothing — the mode that returned zero frames on the slcan
+  firmware.
+* **`monitor --passive` works end to end**, decoding broadcast telemetry into
+  speed, voltage, current, temperature, cadence, torque and state of charge,
+  and raising the voltage cross-check.
+* **Timestamps are usable.** Consecutive frames arrive 1-15 ms apart, matching
+  what the bus can physically carry. The slcan captures had stamped 367 frames
+  across 41 ms, an impossible 9000 frames/s, because they were parsed out of a
+  serial backlog in one burst.
+* **`probe` gives the same answer as it did over slcan** — 5 of 16 commands,
+  identity only. Worth re-running on the clean transport before believing a
+  capability result, and in this case it held.
+
 ## What this does *not* prove
 
 * That any parameter block is laid out correctly on real hardware. The bike
