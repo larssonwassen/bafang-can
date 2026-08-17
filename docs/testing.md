@@ -121,15 +121,45 @@ CAN controller was still in normal mode, driving the dominant ACK bit for
 every frame it received. The first thing [hardware.md](hardware.md) tells you
 to run on a powered bike was therefore transmitting onto its bus.
 
+## 6. On a real bike
+
+Run against a complete bike: drive unit `CR X210.350.FC`, display
+`DP C340.CAN`, torque sensor `SR PA450.32.ST.C`, battery `BT360`. What it
+settled:
+
+* The transport works end to end. `scan` finds all four nodes, `info` returns
+  real identity strings from each, multi-frame reads reassemble correctly.
+* **Node addressing matches the M500/M600 scheme** on this generation:
+  torque sensor 1, drive unit 2, display 3, battery 4. Live traffic decodes
+  into sensible sender/target pairs throughout.
+* **This firmware answers identity reads only** -- 5 of the 16 known commands.
+  `Parameter0/1/2`, the 6017/6018 blocks, `SpeedParameters`, both realtime
+  blocks, `ControllerState` and `ErrorCode` are answered from no source id, so
+  it is a firmware limitation rather than an addressing problem.
+* **It broadcasts what it will not answer.** `ControllerRealtime0/1`,
+  `SensorRealtime`, `BatteryState` and `ControllerState` all arrive
+  continuously as unsolicited broadcasts. `monitor --passive` reads that
+  stream; see [profiles.md](profiles.md).
+* **The controller realtime layout differs from the M500/M600 generation.**
+  `ControllerRealtime1` decoded 51.5 V while `BatteryState` decoded 37.47 V on
+  a 36 V pack at the same instant. `BroadcastRealtime` cross-checks the two and
+  refuses to present the controller's fields as trustworthy when they
+  disagree. `ControllerRealtime0` survived the equivalent check: its torque
+  field read 1265 while the torque sensor's own broadcast read 1261.
+
+A caution about capture fidelity: one capture contained 4% frames whose source
+or target was outside the known device ids, and they were byte-shifted
+fragments of valid frames -- slcan ASCII desync on the USB CDC link, which has
+no checksum to catch it. Another capture at a similar frame rate was clean, so
+the trigger is not understood. gs_usb uses binary framing and cannot fail this
+way.
+
 ## What this does *not* prove
 
-* That the transmit path is correct. Sending into a dead bus tells you
-  nothing: slcan's `send()` just writes ASCII to the serial port and never
-  reports the missing acknowledgement. A gs_usb board could be put in
-  `GS_CAN_MODE_LOOP_BACK` and checked against itself; an slcan board cannot,
-  so on one of those this waits for the bike.
-* That an M200 (G210) lays its parameter blocks out the way the M500/M600
-  generation does. `bafang-can probe` and the workflow in
-  [m200.md](m200.md) exist for exactly that reason.
+* That any parameter block is laid out correctly on real hardware. The bike
+  above answers no parameter read at all, so every block codec remains
+  verified only against the vendored JavaScript. The one realtime block that
+  could be cross-checked on real hardware turned out **not** to match.
+* That writing works. Nothing has ever been written to a real drive unit.
 * Timing behaviour on a loaded bus: the 20 ms inter-frame delay and the 2 s
   request timeout are taken from the upstream projects, not measured here.

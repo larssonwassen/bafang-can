@@ -51,6 +51,7 @@ bafang-can info                     # hardware/software/serial of every node
 bafang-can probe                    # which commands this firmware implements
 bafang-can diagnose                 # read-only health report
 bafang-can monitor                  # live speed/voltage/current/torque/cadence
+bafang-can monitor --passive        # same, from broadcasts, transmitting nothing
 bafang-can sniff --passive          # decode traffic without transmitting
 bafang-can errors                   # stored fault codes with descriptions
 bafang-can dump -o baseline.json    # full configuration backup
@@ -117,7 +118,7 @@ tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 
 ## Validation
 
-Run `pytest` (90 tests, ~26 s). Five layers, described in
+Run `pytest` (109 tests, ~27 s). Six layers, described in
 [docs/testing.md](docs/testing.md):
 
 1. Unit tests for identifiers, checksums, offsets and scaling.
@@ -131,6 +132,24 @@ Run `pytest` (90 tests, ~26 s). Five layers, described in
 4. End-to-end CLI tests against the built-in simulator.
 5. Bench tests on a real adapter with no bike attached, which settled how the
    firmware is identified and made `sniff --passive` genuinely passive.
+6. A session on a real bike, which proved the transport and addressing and
+   found that one realtime block does *not* match this generation.
+
+## What one real bike showed
+
+Run against a `CR X210.350.FC` drive unit with a `DP C340.CAN` display,
+`SR PA450.32.ST.C` sensor and `BT360` battery. The transport, addressing and
+multi-frame reassembly all work; `scan` and `info` return real data from every
+node. Two findings matter for anyone pointing this at similar hardware:
+
+* That firmware **answers identity reads only** — 5 of 16 known commands. No
+  parameter block, no realtime read, no stored error code, from any source id.
+  It does however **broadcast** the realtime data it will not answer, which is
+  what `monitor --passive` reads.
+* Its `ControllerRealtime1` layout **differs** from the M500/M600 generation:
+  it decoded 51.5 V while the battery independently reported 37.47 V on a 36 V
+  pack. `monitor --passive` cross-checks the two and warns rather than
+  presenting the number. `ControllerRealtime0` passed the same kind of check.
 
 ## Status and honesty about the M200
 

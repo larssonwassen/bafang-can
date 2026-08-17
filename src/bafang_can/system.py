@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from . import codecs
 from .commands import READ, WRITE, Command
@@ -51,6 +51,90 @@ class DeviceInfo:
             "present": self.present,
             **self.fields,
         }
+
+
+class BroadcastRealtime:
+    """Latest realtime values, collected from broadcasts as they arrive.
+
+    Nothing is transmitted: this only reads what the bus already carries, so
+    it works with the adapter in listen-only mode. Values are whatever came
+    in most recently, and a key is absent until its first broadcast, which is
+    the honest representation -- a node that never broadcasts is not reported
+    as zero.
+    """
+
+    #: (code, subcode) -> (snapshot key, codec)
+    SOURCES: ClassVar[dict[tuple[int, int], tuple[str, Any]]] = {
+        (0x32, 0x00): ("controller0", codecs.ControllerRealtime0),
+        (0x32, 0x01): ("controller1", codecs.ControllerRealtime1),
+        (0x31, 0x00): ("sensor", codecs.SensorRealtime),
+        (0x34, 0x01): ("battery", codecs.BatteryState),
+    }
+
+    def __init__(self, client: BafangClient) -> None:
+        self._values: dict[str, Any] = {}
+        self._seen: dict[str, float] = {}
+        self._undecodable: dict[str, str] = {}
+        client.add_listener(self._on_message)
+
+    def _on_message(self, message: BafangMessage) -> None:
+        entry = self.SOURCES.get((message.id.code, message.id.subcode))
+        if entry is None:
+            return
+        key, codec = entry
+        try:
+            self._values[key] = codec.decode(message.data)
+        except codecs.DecodeError as exc:
+            # A broadcast whose length does not match what the codec expects
+            # is worth surfacing, not swallowing: it is the signal that this
+            # firmware lays the payload out differently.
+            self._undecodable[key] = str(exc)
+            return
+        self._seen[key] = message.timestamp
+        self._undecodable.pop(key, None)
+
+    #: Fractional disagreement between two independently broadcast voltages
+    #: that is too large to be measurement noise.
+    VOLTAGE_TOLERANCE = 0.1
+
+    def snapshot(self) -> dict[str, Any]:
+        out: dict[str, Any] = dict(self._values)
+        for key, reason in self._undecodable.items():
+            out[f"{key}_error"] = reason
+        disagreement = self._voltage_disagreement()
+        if disagreement is not None:
+            out["layout_warning"] = disagreement
+        return out
+
+    def _voltage_disagreement(self) -> str | None:
+        """Do the controller and the battery agree about the pack voltage?
+
+        They measure the same pack and broadcast it separately, so a large
+        disagreement does not mean one sensor is wrong -- it means a payload
+        is not laid out the way the codec assumes. Measured on a CR
+        X210.350.FC: ControllerRealtime1 decoded 51.5 V while BatteryState
+        decoded 37.47 V on a 36 V pack, so the controller block differs from
+        the M500/M600 generation these codecs were written against. Reporting
+        a confident wrong number is worse than reporting the doubt.
+        """
+        controller = self._values.get("controller1")
+        battery = self._values.get("battery")
+        if controller is None or battery is None or not battery.voltage:
+            return None
+        error = abs(controller.voltage - battery.voltage) / battery.voltage
+        if error <= self.VOLTAGE_TOLERANCE:
+            return None
+        return (
+            f"controller reports {controller.voltage:.2f} V but the battery "
+            f"reports {battery.voltage:.2f} V. The controller payload is "
+            "probably not laid out the way these codecs assume; treat its "
+            "fields as unverified on this firmware."
+        )
+
+    @property
+    def seen(self) -> dict[str, float]:
+        """Timestamp of the most recent broadcast per key."""
+        return dict(self._seen)
 
 
 class BafangSystem:
@@ -127,6 +211,18 @@ class BafangSystem:
         )
 
     # -- live data -------------------------------------------------------
+
+    def passive_realtime(self) -> BroadcastRealtime:
+        """Realtime values taken from broadcasts instead of asked for.
+
+        Some firmware answers no realtime read at all and instead pushes the
+        same payloads onto the bus unsolicited. Measured on a CR X210.350.FC:
+        ``probe`` reports ControllerRealtime0/1 and SensorRealtime as
+        unsupported, while all three arrive continuously as broadcasts. This
+        reads that stream, so :meth:`realtime` and this method cover the two
+        ways a system can offer the same data.
+        """
+        return BroadcastRealtime(self.client)
 
     def realtime(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

@@ -238,32 +238,43 @@ def cmd_diagnose(args) -> int:
         client.close()
 
 
+def _format_realtime(data: dict[str, Any]) -> str:
+    c0 = data.get("controller0")
+    c1 = data.get("controller1")
+    sensor = data.get("sensor")
+    parts = []
+    if c1:
+        parts.append(f"{c1.speed:5.1f} km/h")
+        parts.append(f"{c1.voltage:5.1f} V")
+        parts.append(f"{c1.current:5.1f} A")
+        parts.append(f"ctrl {c1.temperature}C")
+        parts.append(f"motor {c1.motor_temperature}C")
+    if c0:
+        parts.append(f"cad {c0.cadence:3d}")
+        parts.append(f"torque {c0.torque:5d}")
+        parts.append(f"soc {c0.remaining_capacity:3d}%")
+    if sensor:
+        parts.append(f"sensor {sensor.torque:5d}/{sensor.cadence:3d}")
+    line = " | ".join(parts) or "no data"
+    warning = data.get("layout_warning")
+    return f"{line}\n  ! {warning}" if warning else line
+
+
 def cmd_monitor(args) -> int:
-    client, system = _connect(args)
+    # Two ways a system can offer realtime data: answering reads, or pushing
+    # broadcasts. --passive reads the broadcast stream, which is the only one
+    # that works on firmware that answers no realtime read (a CR X210.350.FC
+    # is one such), and it transmits nothing at all.
+    client, system = _connect(args, listen_only=args.passive)
+    source = system.passive_realtime() if args.passive else None
     try:
         end = time.monotonic() + args.seconds if args.seconds else None
         while end is None or time.monotonic() < end:
-            data = system.realtime()
+            data = source.snapshot() if source is not None else system.realtime()
             if args.json:
                 print(json.dumps(_as_json(data), default=str))
             else:
-                c0 = data.get("controller0")
-                c1 = data.get("controller1")
-                sensor = data.get("sensor")
-                parts = []
-                if c1:
-                    parts.append(f"{c1.speed:5.1f} km/h")
-                    parts.append(f"{c1.voltage:5.1f} V")
-                    parts.append(f"{c1.current:5.1f} A")
-                    parts.append(f"ctrl {c1.temperature}C")
-                    parts.append(f"motor {c1.motor_temperature}C")
-                if c0:
-                    parts.append(f"cad {c0.cadence:3d}")
-                    parts.append(f"torque {c0.torque:5d}")
-                    parts.append(f"soc {c0.remaining_capacity:3d}%")
-                if sensor:
-                    parts.append(f"sensor {sensor.torque:5d}/{sensor.cadence:3d}")
-                print(" | ".join(parts) or "no data")
+                print(_format_realtime(data))
             time.sleep(args.interval)
         return 0
     except KeyboardInterrupt:
@@ -710,9 +721,28 @@ def cmd_profile(args) -> int:
     return 0
 
 
+def _parse_can_id(text: str) -> int:
+    """Accept an identifier the way CAN tools actually print it: as hex.
+
+    ``sniff``, ``decode-log`` and candump logs all write bare hex
+    (``02F83200``). Parsing that with ``int(text, 0)`` fails on a leading zero
+    and silently misreads ``12345678`` as decimal, so the output of one
+    command could not be pasted into another. Hex is the only sane default
+    here; ``0x`` is accepted but not required.
+    """
+    cleaned = text.strip().removeprefix("#").replace("_", "")
+    try:
+        return int(cleaned, 16)
+    except ValueError:
+        raise SystemExit(
+            f"'{text}' is not a CAN identifier. Give it as hex, with or "
+            "without the 0x prefix: 02F83200 or 0x02F83200."
+        ) from None
+
+
 def cmd_decode(args) -> int:
     """Decode a CAN identifier without touching hardware."""
-    ident = BafangId.decode(int(args.can_id, 0))
+    ident = BafangId.decode(_parse_can_id(args.can_id))
     _print(dict(dataclasses.asdict(ident), text=str(ident)), args.json)
     return 0
 
@@ -888,6 +918,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("monitor", help="live telemetry")
     p.add_argument("--interval", type=float, default=0.5)
     p.add_argument("--seconds", type=float, default=0, help="0 = until interrupted")
+    p.add_argument(
+        "--passive",
+        action="store_true",
+        help="decode broadcast telemetry instead of asking for it; needed on "
+        "firmware that answers no realtime read, and transmits nothing",
+    )
     p.set_defaults(func=cmd_monitor)
 
     p = add("sniff", help="decode every frame on the bus")
