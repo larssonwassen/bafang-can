@@ -54,6 +54,28 @@ straight into `bafang-can decode-log`. It is the default here only because it
 is the more common factory image; if your board carries slcan, as the one
 tested here does, there is no reason to reflash it.
 
+### Listen-only does not work on the canable2 slcan firmware
+
+Measured on an Openlight Labs CANable2 running
+`github.com/normaldotcom/canable2.git`, against a bus carrying ~165 frames/s:
+
+| mode | frames received in 2 s |
+| --- | --- |
+| listen-only (`L`) | 0, on every one of four trials |
+| normal (`O`) | 330, 330, 331, 330 |
+
+So `sniff --passive` and `monitor --passive` receive **nothing** on this
+firmware, and nothing warns you: the adapter acknowledges no slcan command, so
+python-can cannot tell a channel that opened in listen-only from one that
+never opened. Verified on the wire that the tool does send `S5 L`, so the
+request reaches the adapter and the adapter is what ignores it.
+
+Earlier in the same session, two `sniff --passive` captures on the same
+hardware *did* record traffic (367 and 177 frames). That contradicts the table
+above and is not explained. Until it is, treat `--passive` on an slcan board
+as unreliable rather than merely broken, and use gs_usb if you need a
+guaranteed non-transmitting listen.
+
 One thing only gs_usb gives you: `GS_CAN_MODE_LOOP_BACK`, an internal loopback
 where transmitted frames come straight back with no bus and no second node to
 acknowledge them. That is the only way to test the transmit path before the
