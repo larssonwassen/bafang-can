@@ -28,7 +28,9 @@ are on a bench harness with no other terminator.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -232,7 +234,8 @@ def open_bus(config: AdapterConfig):
     kwargs = config.bus_kwargs()
     log.debug("opening CAN bus: %s", kwargs)
     try:
-        bus = can.Bus(**kwargs)
+        with _relaxed_sample_point(config.interface), _tolerant_detach(config.interface):
+            bus = _open_with_retry(can, kwargs, config.interface)
     except Exception as exc:
         raise RuntimeError(_diagnose(config, exc)) from exc
 
@@ -246,6 +249,182 @@ def open_bus(config: AdapterConfig):
             bus.shutdown()
             raise
     return bus
+
+
+#: How long to keep retrying a gs_usb open while the device re-enumerates.
+GS_USB_OPEN_ATTEMPTS = 6
+GS_USB_OPEN_PAUSE = 0.5
+
+
+@contextmanager
+def _tolerant_detach(interface: str):
+    """Do not let a failed kernel-driver detach abort a gs_usb open.
+
+    ``gs_usb.start()`` detaches the kernel driver from interface 0 whenever the
+    OS reports one attached. Detaching is a Linux concept; on macOS the call
+    returns "[Errno 13] Access denied" and libusb goes on to claim the
+    interface perfectly well without it. Measured on a candleLight 2.5 board:
+    every open raises this, and every open succeeds once it is ignored.
+
+    Only failures of the detach itself are swallowed. If the interface really
+    cannot be claimed, the claim that follows still raises.
+    """
+    if interface != "gs_usb":
+        yield
+        return
+
+    try:
+        import usb.core  # type: ignore import-not-found
+    except ImportError:  # pragma: no cover - optional dependency
+        yield
+        return
+
+    original = usb.core.Device.detach_kernel_driver
+
+    def tolerant(self, number):
+        try:
+            return original(self, number)
+        except usb.core.USBError as exc:
+            log.debug("ignoring kernel-driver detach failure: %s", exc)
+            return None
+
+    usb.core.Device.detach_kernel_driver = tolerant
+    try:
+        yield
+    finally:
+        usb.core.Device.detach_kernel_driver = original
+
+
+def _open_with_retry(can, kwargs: dict[str, Any], interface: str):
+    """Open the bus, riding out the re-enumeration a gs_usb start provokes.
+
+    ``gs_usb.start()`` issues a USB reset, so the adapter disappears and comes
+    back at a new address. A command run straight after another then races that
+    re-enumeration and fails with "[Errno 19] No such device" even though
+    nothing is wrong. Measured: consecutive opens fail without this and all
+    succeed with it.
+    """
+    if interface != "gs_usb":
+        return can.Bus(**kwargs)
+
+    last: Exception | None = None
+    for attempt in range(GS_USB_OPEN_ATTEMPTS):
+        try:
+            return can.Bus(**kwargs)
+        except Exception as exc:
+            last = exc
+            if attempt + 1 < GS_USB_OPEN_ATTEMPTS:
+                # Back off progressively: how long the device stays away
+                # varies, and a fixed short pause loses the race.
+                pause = GS_USB_OPEN_PAUSE * (attempt + 1)
+                log.debug(
+                    "gs_usb open attempt %d failed (%s); the adapter is "
+                    "probably still re-enumerating, retrying in %.1fs",
+                    attempt + 1,
+                    exc,
+                    pause,
+                )
+                time.sleep(pause)
+    assert last is not None
+    raise last
+
+
+#: Sample points to try, in order. 87.5% is the CiA recommendation and what
+#: python-can's gs_usb backend asks for; the rest are ordinary values a CAN
+#: bus runs happily at when the first is arithmetically out of reach.
+SAMPLE_POINTS = (87.5, 85.0, 80.0, 75.0)
+
+
+@contextmanager
+def _relaxed_sample_point(interface: str):
+    """Let the gs_usb backend fall back when 87.5% has no solution.
+
+    python-can's gs_usb backend hardcodes an 87.5% sample point and gives up
+    if no bit timing hits it. Whether one exists depends on the adapter's CAN
+    clock, so a perfectly ordinary bitrate can be unreachable: measured on a
+    candleLight 2.5 board whose clock is 160 MHz, 250 kbit/s needs 640/brp
+    time quanta, and python-can's classic-CAN rules (prescaler <= 32, bit time
+    <= 25 quanta, tseg1 <= 16) leave only 20 quanta, where 87.5% would need a
+    tseg1 of 17. So ``--interface gs_usb --bitrate 250000`` could not open at
+    all, while 85% hits 250000 bit/s exactly.
+
+    This widens the search rather than changing the answer: 87.5% is still
+    tried first and still wins whenever it is achievable.
+    """
+    if interface != "gs_usb":
+        yield
+        return
+
+    try:
+        import can  # type: ignore import-not-found
+    except ImportError:  # pragma: no cover - dependency check happens in open_bus
+        yield
+        return
+
+    original = can.BitTiming.from_sample_point
+
+    def with_fallback(f_clock, bitrate, sample_point=87.5):
+        attempts = (sample_point, *(p for p in SAMPLE_POINTS if p != sample_point))
+        for point in attempts:
+            try:
+                timing = original(f_clock=f_clock, bitrate=bitrate, sample_point=point)
+            except ValueError:
+                continue
+            if point != sample_point:
+                log.info(
+                    "no bit timing for %d bit/s at a %.1f%% sample point on a "
+                    "%d Hz clock; using %.1f%% instead (brp=%d tseg1=%d tseg2=%d)",
+                    bitrate, sample_point, f_clock, point,
+                    timing.brp, timing.tseg1, timing.tseg2,
+                )
+            return timing
+        raise ValueError(
+            f"no bit timing for {bitrate} bit/s on this adapter's {f_clock} Hz "
+            f"clock at any of the sample points {SAMPLE_POINTS}."
+        )
+
+    can.BitTiming.from_sample_point = staticmethod(with_fallback)
+    try:
+        yield
+    finally:
+        can.BitTiming.from_sample_point = original
+
+
+#: gs_usb control request that sets the device mode, and its "start" value.
+_GS_USB_BREQ_MODE = 2
+_GS_USB_MODE_START = 1
+
+
+def _set_gs_usb_mode(gs, flags: int, required: int = 0) -> int:
+    """Change the mode of an already-open gs_usb device.
+
+    ``GsUsb.start()`` looks like the way to do this, but it begins with a USB
+    reset. That invalidates the handle of a bus we have already opened, and on
+    macOS the device re-enumerates at a new address, so the call fails with
+    "[Errno 19] No such device" and the bus is left unusable. Sending the mode
+    control transfer that ``start()`` would send, without the reset, changes
+    the mode in place. Verified on a candleLight 2.5 board by putting an open
+    bus into loopback and reading its own frames back.
+
+    Returns the flags the device actually granted, which is the requested set
+    masked by what it reports supporting. ``required`` names the bits that
+    carry the point of the call -- losing an optional extra like hardware
+    timestamping is fine, losing listen-only is not.
+    """
+    feature = gs.device_capability.feature
+    granted = flags & feature
+    if required and granted & required != required:
+        raise RuntimeError(
+            f"this adapter does not support the requested mode "
+            f"(asked 0x{required:x}, supports 0x{feature:x})"
+        )
+    from gs_usb.gs_usb_structures import DeviceMode  # type: ignore import-not-found
+
+    gs.device_flags = granted
+    gs.gs_usb.ctrl_transfer(
+        0x41, _GS_USB_BREQ_MODE, 0, 0, DeviceMode(_GS_USB_MODE_START, granted).pack()
+    )
+    return granted
 
 
 def _apply_listen_only(bus, interface: str) -> None:
@@ -270,8 +449,11 @@ def _apply_listen_only(bus, interface: str) -> None:
                 "this python-can gs_usb backend does not expose the device, "
                 "so listen-only mode cannot be set"
             )
-        gs.stop()
-        gs.start(GS_CAN_MODE_LISTEN_ONLY | GS_CAN_MODE_HW_TIMESTAMP)
+        _set_gs_usb_mode(
+            gs,
+            GS_CAN_MODE_LISTEN_ONLY | GS_CAN_MODE_HW_TIMESTAMP,
+            required=GS_CAN_MODE_LISTEN_ONLY,
+        )
         return
     if interface == "sim":
         return  # the simulator has no bus to disturb

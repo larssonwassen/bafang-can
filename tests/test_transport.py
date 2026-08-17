@@ -154,30 +154,67 @@ def test_listen_only_is_off_unless_asked_for():
     assert "listen_only" not in AdapterConfig(interface="slcan", channel="/dev/x").bus_kwargs()
 
 
-def test_gs_usb_is_restarted_in_listen_only_mode():
-    """python-can always starts gs_usb devices in normal mode; we restart it."""
+class FakeCapability:
+    def __init__(self, feature):
+        self.feature = feature
+
+
+class FakeUsbHandle:
+    def __init__(self):
+        self.transfers = []
+
+    def ctrl_transfer(self, request_type, request, value, index, data):
+        self.transfers.append((request_type, request, bytes(data)))
+        return len(data)
+
+
+class FakeGsDevice:
+    """A gs_usb device that fails the way the real one does.
+
+    ``GsUsb.start()`` begins with a USB reset, which on real hardware
+    invalidates the handle of an already-open bus. Raising here is what makes
+    this test able to catch a regression to the stop/start approach.
+    """
+
+    def __init__(self, feature=0xFFFF):
+        self.device_capability = FakeCapability(feature)
+        self.device_flags = None
+        self.gs_usb = FakeUsbHandle()
+
+    def stop(self):
+        raise AssertionError("stop() must not be called on an open bus")
+
+    def start(self, flags):
+        raise AssertionError("start() resets the device and breaks the open bus")
+
+
+class FakeGsBus:
+    def __init__(self, feature=0xFFFF):
+        self.gs_usb = FakeGsDevice(feature)
+
+
+def test_gs_usb_listen_only_is_set_without_resetting_the_device():
+    """The reset inside start() kills the handle of an already open bus."""
     from gs_usb.constants import GS_CAN_MODE_LISTEN_ONLY
 
-    class FakeDevice:
-        def __init__(self):
-            self.calls = []
-
-        def stop(self):
-            self.calls.append("stop")
-
-        def start(self, flags):
-            self.calls.append(("start", flags))
-
-    class FakeBus:
-        def __init__(self):
-            self.gs_usb = FakeDevice()
-
-    bus = FakeBus()
+    bus = FakeGsBus()
     transport._apply_listen_only(bus, "gs_usb")
 
-    assert bus.gs_usb.calls[0] == "stop"
-    assert bus.gs_usb.calls[1][0] == "start"
-    assert bus.gs_usb.calls[1][1] & GS_CAN_MODE_LISTEN_ONLY
+    (request_type, request, payload), = bus.gs_usb.gs_usb.transfers
+    assert request_type == 0x41
+    assert request == transport._GS_USB_BREQ_MODE
+    assert bus.gs_usb.device_flags & GS_CAN_MODE_LISTEN_ONLY
+    # The payload is (mode, flags) little-endian; mode 1 is "start".
+    assert payload[:4] == b"\x01\x00\x00\x00"
+
+
+def test_an_adapter_without_listen_only_support_says_so():
+    from gs_usb.constants import GS_CAN_MODE_LISTEN_ONLY
+
+    bus = FakeGsBus(feature=0xFFFF & ~GS_CAN_MODE_LISTEN_ONLY)
+
+    with pytest.raises(RuntimeError, match="does not support the requested mode"):
+        transport._apply_listen_only(bus, "gs_usb")
 
 
 def test_socketcan_listen_only_says_where_to_set_it_instead():

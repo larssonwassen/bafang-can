@@ -118,7 +118,7 @@ tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 
 ## Validation
 
-Run `pytest` (109 tests, ~27 s). Six layers, described in
+Run `pytest` (118 tests, ~27 s). Seven layers, described in
 [docs/testing.md](docs/testing.md):
 
 1. Unit tests for identifiers, checksums, offsets and scaling.
@@ -134,6 +134,8 @@ Run `pytest` (109 tests, ~27 s). Six layers, described in
    firmware is identified and made `sniff --passive` genuinely passive.
 6. A session on a real bike, which proved the transport and addressing and
    found that one realtime block does *not* match this generation.
+7. Hardware loopback on a gs_usb adapter, where frames this tool emits are
+   transmitted and read back byte for byte — the transmit path, finally.
 
 ## What one real bike showed
 

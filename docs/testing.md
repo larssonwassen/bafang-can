@@ -154,6 +154,42 @@ no checksum to catch it. Another capture at a similar frame rate was clean, so
 the trigger is not understood. gs_usb uses binary framing and cannot fail this
 way.
 
+## 7. Transmit path, in hardware loopback
+
+Reflashing the adapter to candleLight (gs_usb) made `GS_CAN_MODE_LOOP_BACK`
+available: the controller feeds its own transmissions back with no bus and no
+second node to acknowledge them. Frames this tool builds go out and come back
+byte for byte -- identifier, extended flag, DLC and payload -- including an
+8-byte multi-frame payload, which is the longest thing it emits. That closes
+the gap this document had described since the beginning, where sending into a
+dead bus proved nothing.
+
+One anomaly is unresolved: sending several frames back to back, the fourth
+came back with identifier `0x00000025` instead of the one sent. Sent on its own
+the same identifier echoes correctly, so it is not the identifier -- something
+desynchronises in the echo path under back-to-back sends, and it is not
+understood.
+
+Getting there took three fixes that only real hardware surfaces, all in
+`transport.py`:
+
+* python-can's gs_usb backend hardcodes an 87.5% sample point. The adapter's
+  CAN clock is 160 MHz, so 250 kbit/s needs 640/brp time quanta, and
+  python-can's classic-CAN rules leave only 20 -- where 87.5% would need a
+  tseg1 of 17 against a maximum of 16. `--interface gs_usb --bitrate 250000`
+  could not open at all. 85% hits 250000 bit/s exactly.
+* `gs_usb.start()` detaches the kernel driver from interface 0. On macOS that
+  returns "Access denied" and libusb claims the interface fine without it.
+* `gs_usb.start()` also issues a USB reset, so the adapter re-enumerates at a
+  new address and a command run straight after another raced it and failed
+  with "No such device".
+
+The third of those is also why listen-only had to change. Setting the mode via
+`stop()`/`start()` reset the device out from under an already-open bus; the
+mode control transfer alone does it in place. The unit test that covered this
+used a fake whose `start()` did nothing, so it passed against code that could
+not work on hardware. The fake now raises if `start()` is called.
+
 ## What this does *not* prove
 
 * That any parameter block is laid out correctly on real hardware. The bike
