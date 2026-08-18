@@ -139,26 +139,32 @@ Run `pytest` (118 tests, ~27 s). Seven layers, described in
 
 ## What one real bike showed
 
-Run against a `CR X210.350.FC` drive unit with a `DP C340.CAN` display,
-`SR PA450.32.ST.C` sensor and `BT360` battery. The transport, addressing and
-multi-frame reassembly all work; `scan` and `info` return real data from every
-node. Two findings matter for anyone pointing this at similar hardware:
+Run against a **G210** drive unit with a `DP C340.CAN` display,
+`SR PA450.32.ST.C` sensor and `BT360` battery — that is, exactly the hardware
+this project targets. Note that `info` reports its model as `CR X210.350.FC`,
+which is the controller's model string; the label on the board underside reads
+`G210` above it. The two are the same unit, not different generations.
+
+The transport, addressing and multi-frame reassembly all work; `scan` and
+`info` return real data from every node. Two findings matter for anyone
+pointing this at similar hardware:
 
 * That firmware **answers identity reads only** — 5 of 16 known commands. No
   parameter block, no realtime read, no stored error code, from any source id.
   It does however **broadcast** the realtime data it will not answer, which is
   what `monitor --passive` reads.
 * Its `ControllerRealtime1` voltage field read **51.0 V while the battery
-  independently reported 37.4 V** on a 36 V pack. Varying the supply settled
-  why: the field tracks real voltage but is scaled **1.363× high**, which made
-  that drive unit trip its (perfectly sensible) 47 V overvoltage threshold at
-  34.5 V of actual pack, disabling assist permanently. The codecs were right
-  and the hardware was faulty — see [docs/m200.md](docs/m200.md) for the
-  method, which is a useful diagnostic in its own right.
-  `monitor --passive` reports the disagreement rather than presenting either
-  number as fact, and that warning is what led to the diagnosis.
-  `ControllerRealtime0` passed the equivalent check, its torque field agreeing
-  with the torque sensor's own broadcast to within four counts.
+  independently reported 37.4 V** on a 36 V pack. That disagreement, surfaced
+  by `monitor --passive`, turned out to be a real hardware fault rather than a
+  decoding bug: the drive unit's voltage sense read **1.363× high**, so it
+  tripped its (perfectly sensible) 47 V overvoltage threshold at 34.5 V of
+  actual pack and disabled assist permanently. The cause was a contamination
+  bridge across one divider resistor — no component had failed. Repaired, the
+  same reading came back to +0.70%. [docs/m200.md](docs/m200.md) has the full
+  method, including the two measurement techniques that gave misleading
+  answers along the way. `ControllerRealtime0` passed the equivalent check,
+  its torque field agreeing with the torque sensor's own broadcast to within
+  four counts.
 
 ## Status and honesty about the M200
 

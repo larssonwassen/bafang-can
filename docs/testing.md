@@ -123,8 +123,11 @@ to run on a powered bike was therefore transmitting onto its bus.
 
 ## 6. On a real bike
 
-Run against a complete bike: drive unit `CR X210.350.FC`, display
-`DP C340.CAN`, torque sensor `SR PA450.32.ST.C`, battery `BT360`. What it
+Run against a complete bike: a **G210** drive unit reporting itself as
+`CR X210.350.FC`, display `DP C340.CAN`, torque sensor `SR PA450.32.ST.C`,
+battery `BT360`. The model string and the family designation are both on the
+unit -- the board's underside label reads `G210` above `CR X210.350.FC` -- so
+this is the hardware the project targets, not a different generation. What it
 settled:
 
 * The transport works end to end. `scan` finds all four nodes, `info` returns
@@ -140,12 +143,17 @@ settled:
   `SensorRealtime`, `BatteryState` and `ControllerState` all arrive
   continuously as unsolicited broadcasts. `monitor --passive` reads that
   stream; see [profiles.md](profiles.md).
-* **The controller realtime layout differs from the M500/M600 generation.**
+* **The voltage cross-check found a hardware fault, not a codec bug.**
   `ControllerRealtime1` decoded 51.5 V while `BatteryState` decoded 37.47 V on
-  a 36 V pack at the same instant. `BroadcastRealtime` cross-checks the two and
-  refuses to present the controller's fields as trustworthy when they
-  disagree. `ControllerRealtime0` survived the equivalent check: its torque
-  field read 1265 while the torque sensor's own broadcast read 1261.
+  a 36 V pack at the same instant. The first reading of that was that the
+  controller block must be laid out differently on this generation. Varying
+  the supply disproved it: the field tracks real voltage, scaled 1.363x high
+  by a fault in the drive unit's own sense path. The codecs were right.
+  `BroadcastRealtime` cross-checks the two and refuses to present the
+  controller's fields as trustworthy while they disagree, which is what
+  surfaced the fault. `ControllerRealtime0` survived the equivalent check: its
+  torque field read 1265 while the torque sensor's own broadcast read 1261.
+  See [m200.md](m200.md) for the full diagnosis.
 
 A caution about capture fidelity: one capture contained 4% frames whose source
 or target was outside the known device ids, and they were byte-shifted
