@@ -144,13 +144,158 @@ def wheel_by_code(code0: int, code1: int) -> Wheel | None:
     return None
 
 
-#: Error codes reported by drive unit / display (command 0x60/0x07).
+#: Error codes, merged from both vendored projects.
 #:
-#: Only three codes have a documented meaning in either upstream project; the
-#: remaining entries are codes that are known to exist but whose meaning is not
-#: documented. Do not invent descriptions for them -- an undocumented code is
-#: reported as such so a wrong guess never drives a repair decision.
-ERROR_DESCRIPTIONS: dict[int, tuple[str, str]] = {
+#: ``OpenBafangTool`` carries three (8, 14, 21) in ``locales/en.json``, with
+#: long repair notes. ``bafang_canable_pro`` carries thirty-three in
+#: ``ui/js/shared.js``, each with a one-line description and a recommendation.
+#: This tool used to expose only OpenBafangTool's three and report the other
+#: twenty-four as "no description available" -- including code 7, which is the
+#: fault the bike in ``docs/m200.md`` was displaying throughout that entire
+#: investigation. The description was vendored in this repository the whole
+#: time.
+#:
+#: Where the two sources overlap they are reconciled explicitly below rather
+#: than by picking one, because on code 14 they genuinely disagree.
+
+_CANABLE_ERRORS: dict[int, tuple[str, str]] = {
+    1: (
+        "Throttle fault",
+        "Inspect the wire from the throttle to the controller for cuts or kinks",
+    ),
+    2: (
+        "Brake sensor malfunction",
+        "Look for pinched, cut, or damaged cables leading from the brake levers to the main wiring harness",
+    ),
+    3: (
+        "Brake Fault",
+        "Brake sensor is active or stuck; check brake levers",
+    ),
+    4: (
+        "Throttle not in correct position",
+        "Check and adjust throttle position, inspect wiring, replace throttle if needed",
+    ),
+    7: (
+        "Over voltage protection",
+        "Check battery and charger compatibility, inspect battery, discharge if overcharged",
+    ),
+    8: (
+        "Hall sensor error",
+        "Check hall sensor connections, inspect for damage, replace if necessary",
+    ),
+    9: (
+        "Motor phase winding fault",
+        "Check motor connections, inspect for damage, test with a different controller",
+    ),
+    10: (
+        "Motor overtemperature",
+        "Allow motor to cool down, reduce load, ensure proper ventilation",
+    ),
+    11: (
+        "Motor temperature sensor fault",
+        "Check sensor connection, inspect for damage, replace if necessary",
+    ),
+    12: (
+        "Motor overcurrent",
+        "Reduce load, check wiring, inspect motor and controller",
+    ),
+    13: (
+        "Battery temperature sensor fault",
+        "Check sensor connection, inspect for damage, replace if necessary",
+    ),
+    14: (
+        "Controller overtemperature",
+        "Allow controller to cool down, reduce load, ensure proper ventilation",
+    ),
+    15: (
+        "Controller temperature sensor fault",
+        "Check sensor connection, inspect for damage, replace if necessary",
+    ),
+    21: (
+        "Speed sensor error",
+        "Check sensor connection, inspect for damage, realign magnets",
+    ),
+    25: (
+        "Torque signal fault",
+        "Check sensor connection, inspect for damage, replace if necessary",
+    ),
+    26: (
+        "Torque sensor speed signal fault",
+        "Check sensor connection, inspect for damage, replace if necessary",
+    ),
+    27: (
+        "Controller overcurrent",
+        "Reduce load, check wiring, inspect motor and controller",
+    ),
+    30: (
+        "Communication failed",
+        "Check connections, update firmware, replace faulty components",
+    ),
+    33: (
+        "Brake detection circuit fault",
+        "Check sensor connection, inspect wiring, replace sensor if needed",
+    ),
+    35: (
+        "15V detection circuit error",
+        "Check power supply and connections, replace damaged components",
+    ),
+    36: (
+        "Keypad detection circuit error",
+        "Check keypad connection, inspect wiring, replace keypad if needed",
+    ),
+    37: (
+        "WDT circuit fault Controller",
+        "Consult a professional for diagnosis and repair",
+    ),
+    41: (
+        "Total voltage from the battery is too high.",
+        "Check battery",
+    ),
+    42: (
+        "Total voltage from the battery is too low.",
+        "Check battery",
+    ),
+    43: (
+        "Total power from the battery cells is too high.",
+        "Check battery",
+    ),
+    45: (
+        "Temperature from the battery is too high.",
+        "Check battery",
+    ),
+    46: (
+        "The temperature of the battery is too low.",
+        "Check battery",
+    ),
+    47: (
+        "SOC of the battery is too high.",
+        "Check battery",
+    ),
+    48: (
+        "SOC of the battery is too low.",
+        "Check battery",
+    ),
+    61: (
+        "Switching detection defect.",
+        "-",
+    ),
+    62: (
+        "Electronic derailleur cannot release.",
+        "-",
+    ),
+    71: (
+        "Electronic lock is jammed.",
+        "-",
+    ),
+    81: (
+        "Bluetooth module has an error.",
+        "-",
+    ),
+}
+
+
+#: OpenBafangTool's three, which carry more usable repair detail.
+_OPENBAFANG_ERRORS: dict[int, tuple[str, str]] = {
     8: (
         "Inner motor hall sensor error (not the speed hall sensor)",
         "Check cable connection, replace motor, or repair the motor if you are "
@@ -168,15 +313,100 @@ ERROR_DESCRIPTIONS: dict[int, tuple[str, str]] = {
     ),
 }
 
-#: Codes seen in the wild without a documented description.
-KNOWN_UNDOCUMENTED_ERRORS = frozenset(
-    {4, 5, 7, 9, 10, 11, 12, 15, 25, 26, 27, 30, 33, 35, 36, 37,
-     41, 42, 43, 45, 46, 47, 48, 71, 81}
-)
+#: Codes where the two upstream projects mean different things.
+#:
+#: Codes documented in the vehicle's own manual (eGoing/Crescent Center,
+#: 2022-11-17, the manual for the exact bike this project is built around).
+#:
+#: A third source, and the only one that is authoritative for *this* vehicle
+#: rather than for the Bafang family in general. Where it is more specific than
+#: the upstream tables it wins -- the upstream projects describe code 21 as a
+#: generic "hall sensor error", while the manual names the speed sensor and
+#: gives the magnet gap to check.
+#:
+#: Descriptions are translated from the Swedish and condensed; they are short
+#: factual repair steps, not the manual's text reproduced.
+_MANUAL_ERRORS: dict[int, tuple[str, str]] = {
+    7: (
+        "Over voltage protection",
+        "Remove the battery and refit it. If it persists, see a dealer.",
+    ),
+    10: (
+        "Motor temperature has reached its maximum",
+        "Switch the system off and let the motor cool.",
+    ),
+    14: (
+        "Controller box temperature has reached its maximum",
+        "Switch the system off and let the controller cool.",
+    ),
+    21: (
+        "Speed sensor fault",
+        "Restart the system. Check the spoke magnet is 10-20 mm from the "
+        "sensor and correctly aligned, and that the sensor cable is seated.",
+    ),
+    25: (
+        "Torque sensor fault",
+        "Check every connector is properly seated.",
+    ),
+    26: (
+        "Torque sensor is not reaching the speed sensor",
+        "Check the speed sensor cable is seated and the sensor undamaged.",
+    ),
+    30: (
+        "Communication fault",
+        "Check that all cables are properly connected.",
+    ),
+    33: (
+        "Brake sensor fault",
+        "Check that all cables are properly connected.",
+    ),
+}
+
+#: Codes the two upstream projects describe incompatibly, and the manual does
+#: not settle.
+#:
+#: Code 14 used to be here: OpenBafangTool calls it a motor communication
+#: error, bafang_canable_pro calls it controller overtemperature, and those
+#: lead to opposite repairs. The vehicle manual names it as the controller box
+#: reaching its temperature limit, which agrees with bafang_canable_pro, so on
+#: this bike the question is answered and both readings are no longer reported.
+#: Nothing currently remains unresolved -- kept because the next code that
+#: disagrees will need it.
+CONFLICTING_ERRORS: frozenset[int] = frozenset()
+
+
+def _merge_error_tables() -> dict[int, tuple[str, str]]:
+    """Merge the three sources, least to most authoritative.
+
+    ``bafang_canable_pro`` has the broadest table, ``OpenBafangTool`` the more
+    detailed entries where it has any, and the vehicle's own manual is
+    definitive for the bike this project targets.
+    """
+    merged = dict(_CANABLE_ERRORS)
+    for code, entry in _OPENBAFANG_ERRORS.items():
+        if code in CONFLICTING_ERRORS:
+            continue  # handled by error_text, which reports both readings
+        merged[code] = entry  # the more detailed of the two
+    merged.update(_MANUAL_ERRORS)
+    return merged
+
+
+ERROR_DESCRIPTIONS: dict[int, tuple[str, str]] = _merge_error_tables()
+
+#: Codes seen in the wild that still have no description in either project.
+KNOWN_UNDOCUMENTED_ERRORS = frozenset({5})
 
 
 def error_text(code: int) -> tuple[str, str]:
     """Return ``(description, recommendation)`` for an error code."""
+    if code in CONFLICTING_ERRORS:
+        theirs = _CANABLE_ERRORS[code]
+        ours = _OPENBAFANG_ERRORS[code]
+        return (
+            f"{ours[0]} -- or {theirs[0].lower()}; the two upstream projects "
+            "disagree about this code",
+            f"{ours[1]} If that is not it: {theirs[1]}",
+        )
     if code in ERROR_DESCRIPTIONS:
         return ERROR_DESCRIPTIONS[code]
     if code in KNOWN_UNDOCUMENTED_ERRORS:
