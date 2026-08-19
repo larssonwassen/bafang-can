@@ -95,7 +95,44 @@ sniff log, and `--sim-profile` makes the simulator answer from it. See
 labelled as invented, because a plausible guess presented as a measurement is
 worse than an obvious guess.
 
-## 5. On the adapter, with no bike attached
+## 5. Against bytes a real bike sent
+
+Layers 1 to 4 all share one blind spot, named in the section above: the
+simulator builds its payloads with this package's own helpers, and the vendored
+JavaScript is an oracle for the *protocol*, not for what a G210 actually puts on
+the wire. `tests/data/display-interaction-excerpt.log` closes part of that gap.
+It is 99 frames of a real `DP C340.CAN` display talking to a real G210, and it
+does two jobs.
+
+**It checks the codecs against evidence rather than agreement.** The strongest
+assertions available are the ones where two independent nodes derive the same
+number from different fields, because no shared bug can produce them:
+
+| check | how it holds |
+| --- | --- |
+| battery `34/00` reports 6111 of 11112 mAh, and 55% RSOC in the same frame | 6111/11112 = 55.0% |
+| drive unit `32/00` independently reports remaining charge | also 55% |
+| torque sensor `31/00` reports 1265 ADC counts | drive unit `32/00` reports 1265 |
+
+**It is the regression corpus for `bafang_can.quality`.** The capture is damaged
+in all three ways that module detects -- 2 identifiers wider than 29 bits, 12
+frames missing from the torque sensor's rolling counter, 24 frames timestamped
+closer together than the shortest frame at 250 kbit/s -- and every count is
+asserted in `tests/test_quality.py`. That matters because these defects are
+invisible in the file itself: the tooling that produced it reported success.
+
+`tests/test_receive_path.py` covers the cause of the frame loss rather than its
+detection. It asserts that a listener blocked inside its callback does not hold
+the receive thread off the bus, that no message is lost when it does, and that
+corrupt identifiers are dropped and counted instead of masked into plausible
+messages.
+
+One disagreement in the capture is *not* asserted as correct: the drive unit
+reports 51.50 V while the battery reports 37.47 V. That is a real hardware
+fault, kept in the fixture so the warning that reports it stays tested. See
+[m200.md](m200.md#diagnosing-an-overvoltage-fault-a-worked-case).
+
+## 6. On the adapter, with no bike attached
 
 An adapter on the bench, with nothing wired to CAN-H/CAN-L, still settles
 everything on the host side of the transceiver. Run against an Openlight Labs
@@ -121,7 +158,7 @@ CAN controller was still in normal mode, driving the dominant ACK bit for
 every frame it received. The first thing [hardware.md](hardware.md) tells you
 to run on a powered bike was therefore transmitting onto its bus.
 
-## 6. On a real bike
+## 7. On a real bike
 
 Run against a complete bike: a **G210** drive unit reporting itself as
 `CR X210.350.FC`, display `DP C340.CAN`, torque sensor `SR PA450.32.ST.C`,
@@ -162,7 +199,7 @@ no checksum to catch it. Another capture at a similar frame rate was clean, so
 the trigger is not understood. gs_usb uses binary framing and cannot fail this
 way.
 
-## 7. Transmit path, in hardware loopback
+## 8. Transmit path, in hardware loopback
 
 Reflashing the adapter to candleLight (gs_usb) made `GS_CAN_MODE_LOOP_BACK`
 available: the controller feeds its own transmissions back with no bus and no
@@ -198,7 +235,7 @@ mode control transfer alone does it in place. The unit test that covered this
 used a fake whose `start()` did nothing, so it passed against code that could
 not work on hardware. The fake now raises if `start()` is called.
 
-## 8. The gs_usb transport, on the bike
+## 9. The gs_usb transport, on the bike
 
 With the adapter reflashed to candleLight and the bike connected, the things
 slcan could not do were checked against real traffic:

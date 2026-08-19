@@ -25,6 +25,7 @@ from typing import Any
 from .constants import (
     LOW_VOLTAGE_LIMITS,
     Wheel,
+    error_text,
     wheel_by_code,
 )
 from .frame import checksum, int_to_bytes_le, string_from_bytes
@@ -372,6 +373,21 @@ class Parameter2(Block):
 
 @dataclass
 class SpeedParameters:
+    """Drive unit 0x32/0x03 -- speed limit, wheel size and circumference.
+
+    Confirmed against the vehicle's own manual, which is about as independent
+    as a check gets: the manual states this bike's wheel setting is locked to
+    28" and its speed to 25 km/h, and decoding the broadcast
+    ``C4 09 C0 01 9D 08`` gives 25.0 km/h and a 28" wheel code. Two documents
+    that share no code path agreeing on both fields.
+
+    Note what "locked" means there. It describes the *display menu*, which
+    shows those two settings and refuses to change them. It is not a property
+    of this message: the drive unit broadcasts `32/03` every two seconds and
+    the write command for it is the same `32/03`, which is why fitting a
+    generic Bafang display is reported to make them adjustable again.
+    """
+
     speed_limit: float  # km/h
     wheel_code: tuple[int, int]
     circumference: int  # mm
@@ -476,12 +492,30 @@ class ControllerRealtime1:
 class SensorRealtime:
     torque: int  # raw ADC counts
     cadence: int  # rpm
+    #: Rolling message counter, present when the sensor broadcasts 4 bytes.
+    #:
+    #: Neither vendored project reads this byte, but a real G210 sensor
+    #: increments it once per broadcast and wraps at 0xFF. That makes it the
+    #: only thing on a Bafang bus that reveals a dropped frame, which is what
+    #: :mod:`bafang_can.quality` uses it for. ``None`` when the payload is the
+    #: 3 bytes the vendor parsers expect, so nothing is invented.
+    #:
+    #: Independently corroborated on an M500: the ``DP_C240_241`` shutdown log
+    #: published by ``OpenSourceEBike/Bafang_M500_M600`` runs 333 frames of
+    #: ``31/00`` in which bytes 0-2 never move and this byte advances by one
+    #: per frame through a full wrap. That project's table calls byte 3
+    #: "Progressive", which is the same observation under a vaguer name.
+    counter: int | None = None
 
     @classmethod
     def decode(cls, data: bytes) -> SensorRealtime:
         if len(data) < 3:
             raise DecodeError("SensorRealtime needs 3 bytes")
-        return cls(torque=_u16(data, 0), cadence=data[2])
+        return cls(
+            torque=_u16(data, 0),
+            cadence=data[2],
+            counter=data[3] if len(data) > 3 else None,
+        )
 
 
 @dataclass
@@ -522,8 +556,403 @@ class BatteryState:
         )
 
 
+#: Accumulator counts per turn of the output shaft. See
+#: :class:`OutputShaftCounter` for how this was measured, and why it is 64
+#: rather than the 60 an early reading against a drill suggested.
+SHAFT_COUNTS_PER_REVOLUTION = 64
+
+
+#: Seconds per tick of the drive unit's 0x30/0x00 uptime counter.
+#:
+#: Measured as 10.023 to 10.028 s across eight captures on two days. The
+#: nominal value is plainly 10 s and the excess is the drive unit's clock
+#: running slow by about 0.26%, so this is the observed figure rather than the
+#: intended one -- using 10.0 would drift a captured boot instant by a second
+#: every six and a half minutes of uptime.
+UPTIME_TICK_SECONDS = 10.026
+
+
+@dataclass
+class SystemUptime:
+    """Drive unit 0x30/0x00 -- how long this drive unit has been powered.
+
+    Four bytes, little-endian, counting ticks of about ten seconds since the
+    drive unit came up. It resets to zero on every power cycle, so it says
+    nothing about the life of the motor; what it gives you is an **absolute
+    reference for when the bus you are looking at was switched on**, which no
+    other message on this bus carries.
+
+    That reference is what makes it worth decoding. Subtracting
+    ``seconds`` from a frame's timestamp reconstructs the power-on instant, and
+    two captures taken from the same power cycle must agree on it. Four
+    captures recorded between 12:42 and 12:51 one afternoon reconstructed the
+    same boot to within 5.5 s across that nine-minute span, and two others
+    taken four minutes apart agreed to 2 s. A capture whose host timestamps are
+    damaged fails that check loudly: the one recording in the set with a
+    mangled time base reconstructs a boot 20000 s away from when it was
+    actually taken.
+
+    Those 5.5 s are the counter's own resolution, not error. It is broadcast
+    once per tick, so where inside a tick a capture began is not observable,
+    and one tick is the tightest bound worth asserting.
+
+    Neither vendored project decodes this message at all. The BESST command
+    table names ``30/00`` ``pulse``, which fits a counter that free-runs from
+    power-on, but publishes no layout for it. The one four-byte sample of it in
+    the ``OpenSourceEBike`` logs, ``00 00 00 44``, does not decode as this
+    counter little-endian; it was captured on a different node address
+    (``02FF3000`` rather than the ``02F83000`` this bike broadcasts), so it may
+    not be the same message, and one sample is not enough to argue from either
+    way. The little-endian reading is what this bike's own frames show: they
+    count ``04 00 00 00``, ``05 00 00 00`` and upward in byte 0.
+    """
+
+    ticks: int
+
+    @property
+    def seconds(self) -> float:
+        return self.ticks * UPTIME_TICK_SECONDS
+
+    @classmethod
+    def decode(cls, data: bytes) -> SystemUptime:
+        if len(data) < 4:
+            raise DecodeError(f"SystemUptime needs 4 bytes, got {len(data)}")
+        return cls(ticks=int.from_bytes(data[:4], "little"))
+
+    def booted_at(self, timestamp: float) -> float:
+        """The wall-clock instant this drive unit powered on.
+
+        ``timestamp`` is when this broadcast was received. Only as good as the
+        capture's time base -- which is the point: disagreement between two
+        captures of one power cycle means the time base, not the counter.
+        """
+        return timestamp - self.seconds
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"ticks": self.ticks, "seconds": round(self.seconds, 1)}
+
+
+@dataclass
+class OutputShaftCounter:
+    """Drive unit 0x32/0x07 bytes 5--6 -- how far the output shaft has turned.
+
+    A u16 little-endian accumulator that only ever increases, and only while
+    the output shaft is moving. Bytes 0--4 have always been zero and are not
+    interpreted here.
+
+    The scale is **64 counts per revolution**, measured over 23 seconds of
+    steady rotation at a cadence the sensor held at 88--89 rpm: the counter
+    advanced at 94.46 counts/s, which is 63.68 counts per revolution, and the
+    same figure comes back as 63.65 and 63.69 over shorter windows inside it.
+
+    A first attempt put this at 60, from a drill labelled 550 rpm whose
+    implied rate came out at 552. The drill was the weaker reference: those
+    labels are no-load figures, and at 64 counts per revolution that run works
+    out to 518 rpm, 94% of the label, which is ordinary for a drill under load.
+    The cadence byte is the better one -- the firmware uses it for its own
+    assist decisions, it was steady to +-0.5 rpm for the whole window, and it
+    agrees with ``ControllerRealtime0``'s cadence byte exactly. Taking it as
+    true rpm puts the count between 63.7 and 64.4, and 64 is the sort of number
+    an encoder actually has.
+
+    It is a trip counter, not an odometer: it was observed restarting from
+    10833 and from 1689 during one afternoon on the bench, and it read exactly
+    0 across both captures of a bike whose motor had no shaft fitted, so
+    nothing had ever turned it. Do not read a distance out of it.
+
+    This is the only trustworthy speed source on the bus above about 450 rpm,
+    where the torque sensor's cadence byte goes non-monotonic;
+    ``ControllerRealtime1``'s speed field stays zero without a wheel-speed
+    signal. Two consecutive broadcasts give a shaft rpm at any speed, which is
+    what makes it worth decoding rather than merely recording.
+
+    Neither vendored project decodes this message at all. The BESST command
+    table names ``30/00`` ``pulse``, which fits a counter that free-runs from
+    power-on, but publishes no layout for it. The one four-byte sample of it in
+    the ``OpenSourceEBike`` logs, ``00 00 00 44``, does not decode as this
+    counter little-endian; it was captured on a different node address
+    (``02FF3000`` rather than the ``02F83000`` this bike broadcasts), so it may
+    not be the same message, and one sample is not enough to argue from either
+    way. The little-endian reading is what this bike's own frames show: they
+    count ``04 00 00 00``, ``05 00 00 00`` and upward in byte 0.
+    """
+
+    counts: int
+
+    @property
+    def revolutions(self) -> float:
+        return self.counts / SHAFT_COUNTS_PER_REVOLUTION
+
+    @classmethod
+    def decode(cls, data: bytes) -> OutputShaftCounter:
+        if len(data) < 7:
+            raise DecodeError(
+                f"OutputShaftCounter needs 7 bytes, got {len(data)}"
+            )
+        return cls(counts=_u16(data, 5))
+
+    def rpm_since(self, previous: OutputShaftCounter, seconds: float) -> float | None:
+        """Shaft speed between two broadcasts, or ``None`` if it cannot be told.
+
+        A count that goes backwards is either a wrap or a restart, and the two
+        need telling apart. The counter is 16 bits, so a wrap can only ever
+        happen from the very top of the range; a restart happens from wherever
+        the counter had got to. Both were observed on the same bench in one
+        afternoon -- 10833 to 158, and 1689 to 0 -- and treating either as a
+        wrap turns it into 857 revolutions inside one 96 ms broadcast.
+
+        A restart yields ``None``: no speed can be derived across it, and
+        saying so is better than reporting a number that is off by three orders
+        of magnitude.
+        """
+        if seconds <= 0:
+            return None
+        if self.counts >= previous.counts:
+            advance = self.counts - previous.counts
+        elif previous.counts > 0xC000 and self.counts < 0x4000:
+            advance = self.counts + 0x10000 - previous.counts
+        else:
+            return None
+        return advance / SHAFT_COUNTS_PER_REVOLUTION / seconds * 60
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"counts": self.counts, "revolutions": round(self.revolutions, 2)}
+
+
+#: Assist-level codes, keyed by how many levels the display is configured for.
+#:
+#: The codes are a lookup table, not an arithmetic scale -- level 5 on a
+#: five-level display is 3, which is lower than level 1's 11. Taken from
+#: ``bafang_canable_pro``'s ``decodeCurrentAssistLevel`` and confirmed on a
+#: ``DP C340.CAN`` by stepping from 5 down to walk assist one press at a time:
+#: the bus produced 3, 23, 21, 13, 11, 0, 6, which is exactly this table read
+#: backwards.
+ASSIST_LEVEL_CODES: dict[int, dict[int, str]] = {
+    3: {0: "0", 12: "1", 2: "2", 3: "3", 6: "walk"},
+    5: {0: "0", 11: "1", 13: "2", 21: "3", 23: "4", 3: "5", 6: "walk"},
+    9: {
+        0: "0", 1: "1", 11: "2", 12: "3", 13: "4",
+        2: "5", 21: "6", 22: "7", 23: "8", 3: "9", 6: "walk",
+    },
+}
+
+
+@dataclass
+class DisplayRealtime:
+    """Display 0x63/0x00 -- what the rider is asking for, broadcast to the drive unit.
+
+    The display pushes this at about 10 Hz whether or not anyone asks, so it is
+    readable in listen-only mode. Layout from ``bafang_canable_pro``'s
+    ``BafangCanDisplayParser.package0``, confirmed byte by byte on a
+    ``DP C340.CAN``: byte 0's low nibble read 5 on a five-level display, byte 1
+    walked the assist table above, and byte 2's two low bits moved exactly as
+    the lamp and the ``+`` button were operated.
+
+    ``ride_mode`` and ``mode_byte`` are the two places the bike's *riding
+    style* could live, and this data cannot yet separate them. The vehicle
+    manual documents a dealer-only "körstilsväljare" with **three** settings --
+    dynamisk, standard, kontroll -- shown on the display as D, S and C. Both
+    vendored projects read byte 0 bit 4 as a **two**-state ride mode, and
+    ``bafang_canable_pro`` comments its own version as "Simplified", so neither
+    accounts for a third state. Byte 3 held ``0x01`` in 3567 of 3568 captured
+    frames; the single exception is the display's very first frame after
+    power-on, which also carries an uninitialised byte 0.
+
+    A three-state setting sitting at its middle value would read 1 in either
+    place, which is exactly what both show. The bit is reported as an integer
+    rather than a bool so that a third state, if it appears there, is visible
+    instead of being flattened; and byte 3 is carried through raw.
+
+    Elimination favours byte 3. The display shows the riding style and never
+    reads a parameter block from the drive unit -- across every capture it has
+    only ever asked it for a serial number and a software version -- so the
+    display holds the setting. The manual says the setting changes how the
+    motor behaves, so the controller must be told, and the only messages the
+    display sends it are this one and ``63/03``, whose single byte is the
+    documented five-minute auto-shutdown. That leaves ``63/00``, and within it
+    the byte nobody has claimed.
+
+    A third source complicates that last step and is recorded here rather than
+    argued away. ``OpenSourceEBike/Bafang_M500_M600`` labels byte 3 **boost
+    mode**, off = ``01`` and on = ``00``. That is not idle speculation -- but
+    it is not an observation either: the same page says the byte "is always 1
+    with my DPC080 display", so its author never saw it change any more than we
+    have. Byte 3 is therefore disputed rather than unclaimed, and the
+    elimination argument is weaker than it was, not dead.
+
+    The same comparison turns up something neither reading covers. On that
+    DPC080 byte 0 reads ``0x05``; on this ``DP C340.C`` it reads ``0x55`` in
+    every frame after boot. Both parsers take the low nibble as the level count
+    -- 5, agreeing -- and then read bits 4 and 5 of the high nibble as
+    ``ride_mode`` and ``boost``. But ``0x5`` in the high nibble also sets **bit
+    6, which no source reads at all**, and it makes the high nibble equal the
+    low one. So ``ride_mode = 1`` and ``boost = False`` on this bike may be
+    nothing but two bits sliced out of a nibble that is not a set of
+    independent flags. ``byte0`` is carried raw so that stays visible.
+
+    It remains an elimination rather than an observation: the setting has never
+    been seen to change. Capturing across a change is what would settle it.
+    """
+
+    assist_levels: int
+    assist_level: str
+    ride_mode: int
+    boost: bool
+    light: bool
+    button_up: bool
+    button_down: bool
+    #: Byte 3. Neither vendored parser reads it, and the third source calls it
+    #: boost mode without having watched it change; see the class docstring.
+    mode_byte: int | None = None
+    #: Byte 0 unmasked. ``assist_levels``, ``ride_mode`` and ``boost`` are all
+    #: slices of it and they do not account for all of its bits.
+    byte0: int = 0
+
+    @classmethod
+    def decode(cls, data: bytes) -> DisplayRealtime:
+        if len(data) < 3:
+            raise DecodeError(f"DisplayRealtime needs 3 bytes, got {len(data)}")
+        levels = data[0] & 0b1111
+        table = ASSIST_LEVEL_CODES.get(levels, {})
+        return cls(
+            assist_levels=levels,
+            # An unknown code is reported as such rather than guessed at: the
+            # table is per-display and only three configurations are known.
+            assist_level=table.get(data[1], f"unknown ({data[1]})"),
+            ride_mode=(data[0] >> 4) & 0b1,
+            boost=bool(data[0] & 0b100000),
+            light=bool(data[2] & 0b1),
+            button_up=bool(data[2] & 0b10),
+            button_down=bool(data[2] & 0b100000),
+            mode_byte=data[3] if len(data) > 3 else None,
+            byte0=data[0],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ControllerState:
+    """Drive unit 0x12/0x00 -- the fault the controller is showing, live.
+
+    One byte, zero when nothing is wrong. Established by capturing the same
+    bike twice: while it displayed error 07 with assist disabled, the drive
+    unit broadcast ``07`` here about ten times a second and the display echoed
+    it on ``13/00``; after the voltage-sense fault was repaired, both read
+    ``00``.
+
+    That matters because ``docs/m200.md`` had recorded that this firmware
+    exposes "no stored fault to clear over CAN" -- true of the *stored* code,
+    which it will not answer a read for, but the live one is on the wire
+    continuously and needs no request at all.
+
+    **A third source reads this byte differently and the disagreement is not
+    settled.** ``OpenSourceEBike/Bafang_M500_M600`` documents ``12/00`` as a
+    bitfield: bit 0 brake applied, bit 1 motor stopped, bit 2 battery
+    undervoltage. Both readings agree that zero means healthy, and they are not
+    reconcilable above that -- under theirs, the ``07`` seen here would mean
+    brake *and* stopped *and* undervoltage on a bike whose fault was a
+    voltage-sense gain error reading high.
+
+    Neither source is obviously stronger. Ours is a correlation with the number
+    the screen displayed, on one bike, before and after a repair. Theirs is a
+    label without a stated experiment, and their own sample value ``0x11`` sets
+    a bit 4 that their three-bit layout does not explain.
+
+    The discriminator is cheap and has not been run: **squeeze the brake lever
+    while capturing.** Under the bitfield reading this byte goes to ``0x01``
+    with the bike otherwise healthy; under the error-code reading it stays
+    ``00``, because 1 is not a fault code. One capture decides it. Until then
+    ``error_code`` is what the evidence at hand supports and this note is what
+    keeps the alternative from being lost.
+    """
+
+    error_code: int
+
+    @property
+    def ok(self) -> bool:
+        return self.error_code == 0
+
+    @property
+    def description(self) -> str:
+        return "no fault" if self.ok else error_text(self.error_code)[0]
+
+    @property
+    def recommendation(self) -> str:
+        return "-" if self.ok else error_text(self.error_code)[1]
+
+    @classmethod
+    def decode(cls, data: bytes) -> ControllerState:
+        if len(data) < 1:
+            raise DecodeError("ControllerState needs 1 byte")
+        return cls(error_code=data[0])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "error_code": self.error_code,
+            "description": self.description,
+            "recommendation": self.recommendation,
+        }
+
+
+@dataclass
+class BatteryChargingInfo:
+    """Battery 0x64/0x01 -- how the pack has been treated over its life.
+
+    Layout from ``bafang_canable_pro``'s ``chargingInfo``: three little-endian
+    u16 in six bytes. The uncharged times are counts of hours; they are kept
+    here as hours and formatted only for display, so nothing depends on the
+    vendor's "Nd Nh" string.
+    """
+
+    charge_cycles: int
+    max_uncharged_hours: int
+    last_uncharged_hours: int
+
+    @classmethod
+    def decode(cls, data: bytes) -> BatteryChargingInfo:
+        if len(data) < 6:
+            raise DecodeError(
+                f"BatteryChargingInfo needs 6 bytes, got {len(data)}"
+            )
+        return cls(
+            charge_cycles=_u16(data, 0),
+            max_uncharged_hours=_u16(data, 2),
+            last_uncharged_hours=_u16(data, 4),
+        )
+
+    @staticmethod
+    def _days_and_hours(hours: int) -> str:
+        return f"{hours // 24}d {hours % 24}h"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "charge_cycles": self.charge_cycles,
+            "max_uncharged": self._days_and_hours(self.max_uncharged_hours),
+            "last_uncharged": self._days_and_hours(self.last_uncharged_hours),
+        }
+
+
 @dataclass
 class DisplayData1:
+    """Display 0x63/0x01 -- odometer, trip, and recorded top speed.
+
+    Confirmed on a `DP C340.C`, which returned ``76 01 00 A3 0E 00 56 03``:
+    374 km total and 374.7 km trip. A trip that has never been reset sitting a
+    fraction above a whole-kilometre total is what these two scalings predict,
+    and no other reading of those bytes puts the pair that close.
+
+    This is the only configuration-shaped block anything on this bus will
+    answer -- the drive unit is silent on all three of its parameter blocks.
+
+    ``max_speed`` deserves suspicion rather than trust. The same read gave
+    85.4 km/h, which no 25 km/h EPAC reaches by pedalling. It is the highest
+    value the display has ever latched, so one spurious speed-sensor reading
+    sets it permanently, and nothing distinguishes that from a real descent.
+    Read it as a high-water mark of the *sensor*.
+    """
+
     total_mileage: int  # km
     single_mileage: float  # km
     max_speed: float  # km/h
@@ -538,9 +967,24 @@ class DisplayData1:
             max_speed=_u16(data, 6) / 10,
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_mileage": self.total_mileage,
+            "single_mileage": round(self.single_mileage, 1),
+            "max_speed": round(self.max_speed, 1),
+        }
+
 
 @dataclass
 class DisplayData2:
+    """Display 0x63/0x02 -- average speed and distance since last service.
+
+    Unlike :class:`DisplayData1` this has **not** been seen answering on real
+    hardware: the `DP C340.C` here is silent on ``63/02``. The layout comes
+    from both vendored parsers agreeing, which is worth something but is not
+    the same as having read it off a bike.
+    """
+
     average_speed: float  # km/h
     service_mileage: float  # km
 
@@ -549,6 +993,98 @@ class DisplayData2:
         if len(data) < 5:
             raise DecodeError("DisplayData2 needs 5 bytes")
         return cls(average_speed=_u16(data, 0) / 10, service_mileage=_u24(data, 2) / 10)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "average_speed": round(self.average_speed, 1),
+            "service_mileage": round(self.service_mileage, 1),
+        }
+
+
+@dataclass
+class DisplayAutoShutdown:
+    """Display 0x63/0x03 -- idle minutes before the system powers itself off.
+
+    One byte of minutes, with 255 meaning never in ``bafang_canable_pro``'s
+    reading. Recorded here as ``05``, and a bench session confirmed the
+    behaviour the hard way: the whole bus went silent partway through a run of
+    reads, with no device answering afterwards.
+
+    The vehicle manual documents this display's setting as five minutes by
+    default, adjustable from 0 to 9 -- so the ``05`` on the wire is this
+    display sitting at its factory value, and the field is minutes as the
+    upstream parser says. Note the manual's range stops at 9, which leaves no
+    room for the 255 "never" case; treat that as a property of other displays
+    in the family rather than of this one.
+
+    A published M500 power-on log settles what this message *is*, which was
+    still open here: it is not a value the display holds and answers reads for,
+    it is a value the display **writes to the drive unit**. In the
+    ``DP_C240_241`` start sequence the display's tenth frame is
+    ``03106303`` -- a write, one byte, ``05`` -- and it repeats it every second
+    or so thereafter, exactly as this bike's display does.
+    """
+
+    minutes: int
+
+    @property
+    def never(self) -> bool:
+        return self.minutes == 0xFF
+
+    @classmethod
+    def decode(cls, data: bytes) -> DisplayAutoShutdown:
+        if len(data) < 1:
+            raise DecodeError("DisplayAutoShutdown needs 1 byte, got 0")
+        return cls(minutes=data[0])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"minutes": "never" if self.never else self.minutes}
+
+
+@dataclass
+class DisplayLightLevels:
+    """Display 0x63/0x04 -- light sensor and backlight levels.
+
+    Four bytes: how many light-sensor steps exist, which one is active, how
+    many backlight steps exist, and which one is active. The layout is
+    ``bafang_canable_pro``'s ``BafangCanDisplayParser.package3``;
+    ``OpenBafangTool`` does not know this message at all.
+
+    This one is directly checkable on a `DP C340.C`, which is unusual for this
+    bus: its menu exposes both halves. The vehicle manual documents the light
+    sensor sensitivity and the backlight brightness as separate settings, each
+    running 0 to 5 and each defaulting to 3 -- which is exactly the shape this
+    layout claims, two independent level counts of 5 with their own current
+    value. Set either from the menu and re-read, and only its own byte should
+    move.
+
+    That makes it the only field on this bus a user can drive to a chosen value
+    on demand rather than wait for the bike to produce.
+    """
+
+    light_sensor_levels: int
+    light_sensor_level: int
+    backlight_levels: int
+    backlight_level: int
+
+    @classmethod
+    def decode(cls, data: bytes) -> DisplayLightLevels:
+        if len(data) < 4:
+            raise DecodeError(f"DisplayLightLevels needs 4 bytes, got {len(data)}")
+        return cls(
+            light_sensor_levels=data[0],
+            light_sensor_level=data[1],
+            backlight_levels=data[2],
+            backlight_level=data[3],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "light_sensor_levels": self.light_sensor_levels,
+            "light_sensor_level": self.light_sensor_level,
+            "backlight_levels": self.backlight_levels,
+            "backlight_level": self.backlight_level,
+        }
 
 
 def decode_error_codes(data: bytes) -> list[int]:
