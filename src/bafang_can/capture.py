@@ -29,7 +29,7 @@ from typing import Any
 
 from .commands import READ
 from .constants import CanOperation, DeviceId
-from .frame import BafangId, BafangMessage
+from .frame import CAN_EFF_MASK, BafangId, BafangMessage
 
 FORMAT = "bafang-can-device-profile"
 VERSION = 1
@@ -171,6 +171,13 @@ def assemble(messages: Iterable[Any], tool: int = int(DeviceId.TOOL)) -> Iterato
 
     for message in messages:
         if not getattr(message, "is_extended_id", False):
+            continue
+        if message.arbitration_id > CAN_EFF_MASK:
+            # A corrupt identifier from a resynchronising slcan reader.
+            # BafangId.decode would mask it into a message that looks like it
+            # came from a real device, and that answer would then be recorded
+            # into a profile and replayed by the simulator as if a bike had
+            # sent it.
             continue
         ident = BafangId.decode(message.arbitration_id)
         data = bytes(message.data)

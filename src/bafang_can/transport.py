@@ -28,6 +28,7 @@ are on a bench harness with no other terminator.
 from __future__ import annotations
 
 import logging
+import struct
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -215,6 +216,222 @@ def _unusable_usb_devices() -> list[Adapter]:
     return unusable
 
 
+#: A gs_usb hardware timestamp is a free-running 32-bit microsecond counter on
+#: the adapter, so it wraps back to zero every 2**32 us.
+GS_USB_TIMESTAMP_WRAP = 2**32 / 1_000_000  # 4294.967296 s, about 71.6 minutes
+
+#: How far back a frame may be and still count as merely late rather than as
+#: the counter having restarted. Reordering on this adapter was measured at
+#: 55--65 ms; a second is a wide margin around that and far short of a wrap.
+RESET_BACKWARDS_LIMIT = 1.0
+
+
+#: How long to drain the adapter after opening it, before recording anything.
+#:
+#: ``GsUsb.start()`` resets the device, and the frames it had already queued
+#: survive that and are delivered first. Measured on a candleLight 2.5: the
+#: first 14 torque-sensor broadcasts of a capture came from before the reset,
+#: their sequence counters running 0x20..0x2E before the live stream resumed at
+#: 0x90. Nothing downstream can tell those apart from current traffic -- they
+#: look exactly like a 97-frame burst of packet loss, which is how they were
+#: first noticed.
+GS_USB_SETTLE = 0.25
+
+
+def _drain_stale_frames(bus) -> int:
+    """Throw away whatever the adapter queued before we reset it.
+
+    Costs the first quarter-second of a capture, about forty frames on a
+    Bafang bus. That is a real price, and much smaller than the alternative:
+    a capture that opens with a block of frames from a previous session,
+    timestamped from a clock that no longer exists.
+    """
+    discarded = 0
+    deadline = time.monotonic() + GS_USB_SETTLE
+    while time.monotonic() < deadline:
+        try:
+            if bus.recv(timeout=0.02) is None:
+                continue
+        except Exception:  # pragma: no cover - a short frame counts as drained
+            discarded += 1
+            continue
+        discarded += 1
+    log.debug("discarded %d frames while the adapter settled", discarded)
+    return discarded
+
+
+class _SkipMalformedFrames:
+    """Drop a USB frame the gs_usb library cannot unpack, instead of dying.
+
+    ``GsUsb.read`` decides how many bytes a frame should be from the mode flags
+    it believes are set -- 24 with hardware timestamping, 20 without -- and
+    hands the buffer straight to ``struct.unpack``, which raises if the length
+    does not match exactly.
+
+    That is not hypothetical either. ``GsUsb.start()`` begins with a USB device
+    reset, so the adapter re-enumerates and begins streaming, and the first
+    frame or two can still arrive in the 20-byte format from before hardware
+    timestamping took effect. Measured on a candleLight 2.5: one short frame in
+    the first 300 of a session, then none in the following 4000. python-can
+    lets the ``struct.error`` escape through ``recv``, so a capture that was
+    about to run perfectly for twenty minutes dies on its first frame with
+    ``unpack requires a buffer of 24 bytes`` and no indication of what to do.
+
+    A frame we cannot parse is one frame lost. Reporting it and carrying on is
+    the proportionate response; :class:`bafang_can.quality.LinkQuality` will
+    count the gap it leaves in the sensor's sequence like any other loss.
+    """
+
+    def __init__(self, bus) -> None:
+        self._bus = bus
+        #: Frames dropped because the USB buffer was not the expected length.
+        self.malformed = 0
+
+    def recv(self, timeout=None):
+        try:
+            return self._bus.recv(timeout=timeout)
+        except struct.error as exc:
+            self.malformed += 1
+            if self.malformed == 1:
+                log.warning(
+                    "the adapter sent a USB frame of unexpected length (%s); "
+                    "dropping it and continuing. This usually happens once, "
+                    "just after the device resets on open.",
+                    exc,
+                )
+            else:
+                log.debug("dropped another malformed USB frame: %s", exc)
+            return None
+
+    def __getattr__(self, name):
+        return getattr(self._bus, name)
+
+
+class _WallClockTimestamps:
+    """Give gs_usb frames an epoch timestamp, the way slcan frames already have.
+
+    python-can's two backends disagree about what ``Message.timestamp`` means,
+    and nothing downstream can tell which it got:
+
+    * slcan stamps ``time.time()`` -- seconds since the epoch;
+    * gs_usb passes the adapter's hardware timestamp straight through, which
+      is a free-running microsecond counter since the adapter powered up.
+
+    So the same capture command writes epoch times on one firmware and
+    small uptime values on the other, and a candump log from the second cannot
+    be lined up against anything. Worse, that counter is 32 bits of
+    microseconds and wraps every 71.6 minutes; when it does, timestamps jump
+    backwards, and ``CanutilsLogWriter`` responds by clamping every later
+    frame to the last value it saw -- so a capture longer than 71 minutes
+    silently freezes its clock partway through.
+
+    This converts the device counter to epoch by anchoring the first frame to
+    ``time.time()`` and accumulating wraps, which keeps the adapter's precise
+    inter-frame timing while making the numbers comparable to everything else.
+
+    If the adapter did not grant hardware timestamping the counter stays at
+    zero for every frame; that is detected and replaced with host receive
+    times, which are coarse but not wrong.
+
+    Frames that genuinely arrive out of order keep their earlier timestamp
+    rather than being clamped forward: the adapter is reporting when the frame
+    reached the transceiver, and that is the more truthful number even when it
+    is not monotonic. ``CanutilsLogWriter`` preserves them too -- it compares
+    every timestamp against the *first* one it wrote, not the last, so only a
+    frame older than the start of the capture is clamped. That is exactly what
+    an unhandled wrap produces, and why it has to be handled here: without this
+    class every frame after a wrap would be written with the capture's opening
+    timestamp, and the log's clock would stop dead for the rest of the run.
+    """
+
+    def __init__(self, bus) -> None:
+        self._bus = bus
+        self._anchor: float | None = None
+        self._first_device: float = 0.0
+        self._previous_device: float = 0.0
+        self._wraps: float = 0.0
+        self._warned_no_hw = False
+        self._seen = 0
+        self._last_emitted = 0.0
+
+    def recv(self, timeout=None):
+        message = self._bus.recv(timeout=timeout)
+        if message is not None:
+            message.timestamp = self._to_epoch(message.timestamp)
+        return message
+
+    def _to_epoch(self, device: float) -> float:
+        now = time.time()
+        if not device:
+            # No hardware timestamping: every frame comes through as 0.0.
+            if not self._warned_no_hw:
+                self._warned_no_hw = True
+                log.warning(
+                    "this adapter did not grant hardware timestamping, so "
+                    "frame times are host receive times and are only as "
+                    "precise as the host can read the USB endpoint"
+                )
+            return now
+
+        self._seen += 1
+        if self._anchor is None:
+            return self._reanchor(now, device)
+
+        drop = self._previous_device - device
+        if self._seen == 2 and drop > RESET_BACKWARDS_LIMIT:
+            # The frame we anchored on was a straggler queued before the device
+            # reset, carrying a timestamp from the counter's previous life.
+            # Left alone, every frame in the capture lands before the anchor,
+            # the log writer clamps them all to the opening timestamp, and the
+            # recorded clock freezes for the whole run. A genuine wrap on the
+            # second frame of a capture is not a real possibility, so the
+            # ordinary wrap test does not get to claim this one.
+            log.warning(
+                "the first frame carried a stale timestamp from before the "
+                "adapter reset; re-anchoring the capture clock"
+            )
+            return self._reanchor(now, device)
+        if drop > GS_USB_TIMESTAMP_WRAP / 2:
+            self._wraps += GS_USB_TIMESTAMP_WRAP
+            log.debug("gs_usb timestamp counter wrapped")
+        elif drop > RESET_BACKWARDS_LIMIT:
+            # Too far back to be a late frame, too little to be a wrap: the
+            # counter restarted.
+            log.warning(
+                "the adapter's timestamp counter restarted; re-anchoring the "
+                "capture clock"
+            )
+            return self._reanchor(now, device)
+        # Anything else that is behind the previous frame is simply a frame
+        # that arrived late, and keeps its earlier timestamp.
+        self._previous_device = device
+        return self._emit(
+            self._anchor + (device - self._first_device) + self._wraps
+        )
+
+    def _reanchor(self, now: float, device: float) -> float:
+        """Start the capture clock again from here, without going backwards.
+
+        Anchoring straight to ``time.time()`` is not enough on its own: the
+        adapter's clock can have run further than the host's since the capture
+        began, and an anchor behind the last timestamp already emitted would
+        make the recorded clock step back -- the very thing re-anchoring exists
+        to prevent.
+        """
+        self._anchor = max(now, self._last_emitted)
+        self._first_device = device
+        self._previous_device = device
+        self._wraps = 0.0
+        return self._emit(self._anchor)
+
+    def _emit(self, timestamp: float) -> float:
+        self._last_emitted = max(self._last_emitted, timestamp)
+        return timestamp
+
+    def __getattr__(self, name):
+        return getattr(self._bus, name)
+
+
 def open_bus(config: AdapterConfig):
     """Open a python-can bus, raising a readable error if that is not possible."""
     if config.interface == "sim":
@@ -248,7 +465,33 @@ def open_bus(config: AdapterConfig):
             # rather than hand back a bus that still ACKs.
             bus.shutdown()
             raise
+    if config.interface == "gs_usb":
+        _drain_stale_frames(bus)
+        bus = _WallClockTimestamps(_SkipMalformedFrames(bus))
+    if config.interface == "slcan":
+        _discard_stale_input(bus)
     return bus
+
+
+def _discard_stale_input(bus) -> None:
+    """Throw away whatever the serial port buffered before we opened it.
+
+    python-can's slcan backend configures the bitrate, sends the open command
+    and starts reading, without ever clearing the input buffer. On a port that
+    was left open by an earlier session the kernel has been buffering CAN
+    traffic the whole time, so the first thing a new capture records is a
+    backlog: frames that arrived minutes ago, drained as fast as the reader
+    can go and stamped with the current time.
+
+    That is not hypothetical. ``captures/bike-live-2026-08-17.log`` in this
+    repository is 367 frames covering 2.21 s of bus traffic, written into a
+    40.6 ms window -- 54x compressed, with frames 56 us apart on a bus whose
+    shortest frame takes 268 us. Nothing about the file says so.
+    """
+    try:
+        bus.flush()
+    except Exception:  # pragma: no cover - not every backend has one
+        log.debug("could not flush the serial input buffer", exc_info=True)
 
 
 #: How long to keep retrying a gs_usb open while the device re-enumerates.

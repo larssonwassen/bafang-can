@@ -111,10 +111,151 @@ never opened. Verified on the wire that the tool does send `S5 L`, so the
 request reaches the adapter and the adapter is what ignores it.
 
 Earlier in the same session, two `sniff --passive` captures on the same
-hardware *did* record traffic (367 and 177 frames). That contradicts the table
-above and is not explained. Until it is, treat `--passive` on an slcan board
-as unreliable rather than merely broken, and use gs_usb if you need a
-guaranteed non-transmitting listen.
+hardware *did* record traffic (367 and 177 frames). Half of that is now
+explained, and the half that is not is the reason to keep treating `--passive`
+on an slcan board as unreliable rather than merely broken.
+
+The 367-frame capture never came off the wire live. Its 367 frames span
+**40.6 ms**, which is 9045 frames/s; the shortest possible 29-bit frame at
+250 kbit/s occupies the bus for 268 us, so the ceiling is about 3700/s and the
+measured minimum gap of 56 us is impossible. Reconstructing the real duration
+from the torque sensor's broadcast period instead:
+
+| | |
+| --- | --- |
+| `31/00` period, consecutive counters only | 11.46 ms |
+| 193 sensor frames x 11.46 ms | **2.21 s** of bus time |
+| recorded span | 40.6 ms, so **54x compressed** |
+| 367 frames / 2.21 s | **166 frames/s** |
+
+166 frames/s is the same bus rate as the table above. So the file is 2.2 s of
+genuine traffic, complete (its counter sequence has no gaps at all), read out
+of a buffer in one burst and stamped with the host clock as it drained.
+python-can's slcan backend configures the bitrate, sends the open command and
+starts reading without ever clearing the serial input buffer, so a port that an
+earlier session left open hands the next one a backlog. `open_bus` now flushes
+it, and `sniff` reports frames that arrive closer together than the bus allows.
+
+The 177-frame capture is different and still contradicts the table: 185 sensor
+slots x 11.46 ms is 2.12 s of bus time inside a 2.38 s recording, so that one
+really was live. It is also badly damaged -- 53% of the sensor broadcasts
+missing and seven corrupt frames -- for a separate reason described under
+[frame loss](#frame-loss-on-slcan) below.
+
+Both captures were made on slcan; the epoch timestamps in them prove it, since
+python-can's gs_usb backend passes the adapter's own uptime counter through
+instead. This bench has since been reflashed to candleLight 2.5 (gs_usb), so
+everything in this section is a record of slcan behaviour, not a description of
+the adapter as it stands today.
+
+### Frame loss on slcan
+
+python-can's slcan reader takes one byte at a time from the serial port. At
+166 frames/s of roughly 19 ASCII characters that is about 3200 `read(1)` calls
+a second, and anything that holds the reading thread up -- this tool used to
+run every listener on it, including the one printing a line per frame -- lets
+the kernel tty buffer fill and overflow. What that costs is measurable, because
+the torque sensor numbers its broadcasts:
+
+| capture | sensor frames | lost | corrupt |
+| --- | --- | --- | --- |
+| 367-frame (drained backlog) | 193 | 0 | 0 |
+| 177-frame (live) | 87 | **98 (53%)** | 7 |
+
+A dropped serial byte does not merely lose a frame, it desynchronises the
+reader: it resumes mid-frame and produces an identifier wider than the 29 bits
+CAN has. python-can parses that with `int(text, 16)` and no range check, and
+five of the seven corrupt frames here are of that kind. `BafangId.decode` masks
+to 29 bits, so before this was caught they decoded into confident-looking
+messages from devices that are not on the bus.
+
+Three things now address it: the receive thread does nothing but drain the
+adapter and hands messages to a second thread, identifiers outside 29 bits are
+rejected rather than masked, and `decode-log`, `import-capture` and `sniff` all
+report what a capture lost. None of it makes slcan reliable at this frame rate;
+it makes the damage visible instead of silent.
+
+### gs_usb timestamps are not wall-clock times
+
+The two backends disagree about what `Message.timestamp` means, and nothing
+downstream can tell which one it got. slcan stamps `time.time()`. gs_usb passes
+through the adapter's hardware timestamp, which is a free-running **32-bit
+microsecond counter** since the adapter powered up -- so it starts near zero
+and **wraps every 71.6 minutes**. When it wraps, timestamps jump backwards past
+the start of the capture, and `CanutilsLogWriter` compares each timestamp
+against the *first* one it wrote rather than the last: every frame after the
+wrap is written with the capture's opening timestamp, and the log's clock stops
+dead for the rest of the run.
+
+`open_bus` therefore anchors the first gs_usb frame to `time.time()` and
+accumulates wraps, which keeps the adapter's precise inter-frame timing while
+making the numbers comparable to an slcan log. If the adapter does not grant
+`GS_CAN_MODE_HW_TIMESTAMP` the counter stays at zero for every frame; that is
+detected and replaced with host receive times, which are coarser but not wrong.
+
+### A short USB frame ends the capture
+
+`GsUsb.read` decides how long a frame should be from the mode flags it believes
+are set -- 24 bytes with hardware timestamping, 20 without -- and hands the
+buffer to `struct.unpack`, which raises unless the length matches exactly.
+`GsUsb.start()` opens with a USB device reset, so the adapter re-enumerates and
+starts streaming, and the first frame or two can still arrive in the 20-byte
+format from before timestamping took effect. Measured on a candleLight 2.5: one
+short frame in the first 300 of a session, then none in the next 4000.
+
+python-can lets that `struct.error` escape through `recv`, so a capture that
+would have run for twenty minutes dies on its first frame with
+`unpack requires a buffer of 24 bytes` and no hint about what to do.
+`open_bus` now drops the unparseable frame, warns once and continues; the gap it
+leaves shows up in the sensor's sequence counter like any other lost frame.
+
+Related: because `start()` resets the device, opening the adapter twice in quick
+succession can fail with `[Errno 19] No such device` while it is still
+re-enumerating. `_open_with_retry` allows six attempts half a second apart,
+which covers a normal back-to-back capture but not a tight loop.
+
+### Everything queued before the reset arrives first
+
+`GsUsb.start()` resets the device, and the frames it had already queued survive
+that reset and are delivered before any live traffic. On a candleLight 2.5 this
+produced three separate faults, all from the same cause, and none of them
+looked like each other:
+
+* the first frame or two arrive in the pre-timestamp 20-byte format and crash
+  `struct.unpack` (above);
+* the first 14 torque-sensor broadcasts of a capture came from before the
+  reset, their counters running `0x20..0x2E` before the live stream resumed at
+  `0x90` -- reported as **97 lost frames**, which is not what had happened;
+* worst, a stale first frame carries a timestamp from the counter's previous
+  life. Anchoring the capture clock to it puts every subsequent frame *before*
+  the anchor, `CanutilsLogWriter` clamps them all to the opening timestamp, and
+  a 30 s capture arrives on disk spanning **5.1 s of frozen clock** with 83% of
+  its frames reading as faster than the bus can carry.
+
+`open_bus` now drains the adapter for 250 ms before recording anything, which
+costs about forty frames at the start of a capture and removes all three. A
+fourth showed up later in the same logs: a stale frame at the head of a capture
+leaves a 1357-count step in the drive unit's shaft counter across the boundary
+between the old stream and the new, which reads as 7977 rpm on a crank
+spindle. The
+timestamp wrapper additionally re-anchors if the counter restarts mid-stream,
+and never lets a re-anchor move the recorded clock backwards.
+
+The third of those is also why `sniff` re-reads the file it just wrote and
+reports on that, rather than on the counters it kept while recording. The two
+disagreed: live, the capture looked perfect.
+
+### Telling a wrap from a late frame
+
+A wrap must be told apart from a frame simply arriving late. Measured on a
+candleLight 2.5 in listen-only mode: the counter is a true microsecond clock
+(device time advances 1.000 us per us of host time over 5 s), but **about four
+frames every five seconds arrive out of order**, each 55--65 ms behind the one
+before it. Treating any backwards step as a wrap therefore added 4295 s
+thirteen times during a 15 s capture, which was reported as 55849 s long. Only
+a drop of more than half the counter range counts as a wrap; a late frame keeps
+its earlier timestamp, which is the truthful record of when it reached the
+transceiver.
 
 One thing only gs_usb gives you: `GS_CAN_MODE_LOOP_BACK`, an internal loopback
 where transmitted frames come straight back with no bus and no second node to

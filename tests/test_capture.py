@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import can
 import pytest
@@ -235,3 +236,53 @@ def test_sniff_records_a_log_that_import_capture_can_read(tmp_path, capsys):
     profile = DeviceProfile.load(out)
     assert profile.responses
     assert profile.source.startswith("log: ")
+
+
+# ---------------------------------------------------------------------------
+# corrupt frames must not become recorded answers
+# ---------------------------------------------------------------------------
+
+
+def test_an_identifier_wider_than_29_bits_is_not_assembled():
+    """0x2F830100 came off a real capture. It is line noise, not a device.
+
+    BafangId.decode masks to 29 bits, which would turn this into a NORMAL_ACK
+    from device 0x0f -- recorded into a profile and replayed by the simulator
+    as though a bike had sent it.
+    """
+    corrupt = can.Message(
+        arbitration_id=0x2F830100,
+        data=bytes.fromhex("04d40f"),
+        is_extended_id=True,
+        timestamp=1.0,
+    )
+
+    assert list(assemble([corrupt])) == []
+
+
+def test_a_corrupt_frame_does_not_displace_the_good_one_beside_it():
+    good = message(
+        DeviceId.BATTERY, DeviceId.TOOL, CanOperation.NORMAL_ACK, 0x64, 0x01,
+        data=bytes.fromhex("0b0062175a02"),
+    )
+    corrupt = can.Message(
+        arbitration_id=0x28308000, data=b"", is_extended_id=True, timestamp=1.0
+    )
+
+    recovered = list(assemble([corrupt, good, corrupt]))
+
+    assert len(recovered) == 1
+    assert recovered[0].data == bytes.fromhex("0b0062175a02")
+
+
+def test_a_profile_built_from_a_damaged_capture_still_reports_the_damage(tmp_path):
+    """The profile is built from what survived; the warning says what did not."""
+    from bafang_can.quality import analyse_log
+
+    fixture = Path(__file__).parent / "data" / "display-interaction-excerpt.log"
+    quality = analyse_log(fixture)
+
+    assert quality.lost == 12
+    assert not quality.healthy
+    # And the frames that did survive are still usable.
+    assert profile_from_log(fixture).responses
