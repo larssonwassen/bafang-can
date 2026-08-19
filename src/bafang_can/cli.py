@@ -13,14 +13,16 @@ import json
 import logging
 import sys
 import time
+from collections import Counter
 from typing import Any
 
 from . import codecs
 from .commands import READ, WRITE, Command
 from .constants import WHEEL_TABLE, DeviceId, wheel_by_text
-from .frame import BafangId
+from .frame import CAN_EFF_MASK, BafangId
 from .profiles import m200
 from .protocol import BafangClient, BafangError
+from .quality import analyse_log, iter_frames
 from .system import BafangSystem
 from .transport import AdapterConfig, find_adapters, open_bus
 
@@ -182,6 +184,61 @@ def cmd_info(args) -> int:
         client.close()
 
 
+def _probe_verdict(result: dict[str, str], device) -> str:
+    """Summarise a probe, and say what refusals versus silence imply.
+
+    A firmware that answers only identity reads raises an obvious question:
+    is the rest missing, or present and blocked? The bus answers it, but only
+    if the two are reported separately. ERROR_ACK means a handler exists and
+    declined. Silence means no handler ran.
+
+    ``empty`` counts as a handler having run. A zero-length multi-frame answer
+    is a reply, not an absence, so it must never be swept into the refused
+    list -- it proves the command exists and says nothing about blocking.
+    """
+    control = result.get("ControlUnassigned")
+    probed = {k: v for k, v in result.items() if k != "ControlUnassigned"}
+    counts = Counter(probed.values())
+    replied = counts["answered"] + counts["empty"]
+    body = [
+        f"{replied}/{len(probed)} commands answered by {device.name}",
+        f"  answered  {counts['answered']}",
+        f"  empty     {counts['empty']}  (a reply with a zero-length payload)",
+        f"  refused   {counts['refused']}  (ERROR_ACK -- the firmware knows these)",
+        f"  silent    {counts['silent']}  (no answer at all)",
+    ]
+    if control is not None:
+        body.append(
+            f"  control   a command that does not exist was {control}, "
+            "which is what an unimplemented command looks like here"
+        )
+        blocked = [
+            name
+            for name, outcome in probed.items()
+            if outcome not in ("answered", "empty", control)
+        ]
+        if blocked:
+            body.append(
+                "\nThese are refused where an unimplemented command is "
+                f"{control}, so this firmware has handlers for them and is "
+                "declining: " + ", ".join(sorted(blocked))
+            )
+        elif replied < len(probed) and control == "silent":
+            body.append(
+                "\nEvery unanswered command behaves exactly like one that does "
+                "not exist, so nothing here suggests they are implemented and "
+                "blocked -- they look absent from this firmware."
+            )
+        elif replied < len(probed):
+            body.append(
+                "\nThis firmware answers ERROR_ACK even to a command that does "
+                "not exist, so a refusal proves nothing about whether the "
+                "others are implemented. This probe cannot tell blocked from "
+                "absent on this unit."
+            )
+    return "\n".join(body)
+
+
 def cmd_probe(args) -> int:
     client, system = _connect(args)
     try:
@@ -189,8 +246,7 @@ def cmd_probe(args) -> int:
         result = system.capabilities(device)
         _print(result, args.json)
         if not args.json:
-            supported = [name for name, ok in result.items() if ok]
-            print(f"\n{len(supported)}/{len(result)} commands answered by {device.name}")
+            print(f"\n{_probe_verdict(result, device)}")
         return 0
     finally:
         client.close()
@@ -212,10 +268,11 @@ def cmd_diagnose(args) -> int:
             return 2
         report["identity"] = system.info(DeviceId.DRIVE_UNIT).to_dict()
         try:
+            found, source = system.errors_with_source()
             report["errors"] = [
-                {"code": c, "description": d, "recommendation": r}
-                for c, d, r in system.errors()
+                {"code": c, "description": d, "recommendation": r} for c, d, r in found
             ]
+            report["errors_read_from"] = source.name
         except BafangError as exc:
             report["errors"] = f"not readable: {exc}"
         report["realtime"] = system.realtime()
@@ -231,11 +288,16 @@ def cmd_diagnose(args) -> int:
             report["parameter1_problems"] = m200.check_parameter1(block)
         except (BafangError, codecs.DecodeError) as exc:
             report["parameter1"] = f"not readable: {exc}"
+        report["display"] = system.display_data()
         report["checklist"] = list(m200.DIAGNOSTIC_STEPS)
         _print(report, args.json)
         return 0
     finally:
         client.close()
+
+
+def _temperature(value: int | None) -> str:
+    return "n/a" if value is None else f"{value}C"
 
 
 def _format_realtime(data: dict[str, Any]) -> str:
@@ -247,15 +309,66 @@ def _format_realtime(data: dict[str, Any]) -> str:
         parts.append(f"{c1.speed:5.1f} km/h")
         parts.append(f"{c1.voltage:5.1f} V")
         parts.append(f"{c1.current:5.1f} A")
-        parts.append(f"ctrl {c1.temperature}C")
-        parts.append(f"motor {c1.motor_temperature}C")
+        # 0xFF means the sensor is absent, which the codec reports as None.
+        # This bike has no motor thermistor, so printing "motor NoneC" was the
+        # normal case rather than an edge case.
+        parts.append(f"ctrl {_temperature(c1.temperature)}")
+        parts.append(f"motor {_temperature(c1.motor_temperature)}")
     if c0:
         parts.append(f"cad {c0.cadence:3d}")
         parts.append(f"torque {c0.torque:5d}")
         parts.append(f"soc {c0.remaining_capacity:3d}%")
     if sensor:
         parts.append(f"sensor {sensor.torque:5d}/{sensor.cadence:3d}")
+    battery = data.get("battery")
+    if battery:
+        parts.append(f"batt {battery.voltage:5.1f} V {battery.temperature}C")
+    display = data.get("display")
+    if display:
+        parts.append(f"assist {display.assist_level}/{display.assist_levels}")
+        if display.light:
+            parts.append("light on")
+    rpm = data.get("shaft_rpm")
+    if rpm is not None:
+        parts.append(f"shaft {rpm:5.0f} rpm")
+    capacity = data.get("battery_capacity")
+    if capacity:
+        parts.append(
+            f"pack {capacity.capacity_left}/{capacity.full_capacity} mAh "
+            f"soh {capacity.soh}%"
+        )
     line = " | ".join(parts) or "no data"
+
+    # Slow-moving values go on their own line: they are configuration and
+    # history, not telemetry, and repeating them in the scrolling line would
+    # crowd out the numbers that actually change.
+    extra = []
+    speed = data.get("speed_parameters")
+    if speed:
+        wheel = speed.wheel.text + '"' if speed.wheel else "unknown wheel"
+        extra.append(
+            f"limit {speed.speed_limit:.0f} km/h, {wheel}, "
+            f"{speed.circumference} mm"
+        )
+    charging = data.get("battery_charging")
+    if charging:
+        extra.append(
+            f"{charging.charge_cycles} charge cycles, last full charge "
+            f"{charging.last_uncharged_hours // 24}d ago"
+        )
+    uptime = data.get("uptime")
+    if uptime is not None:
+        extra.append(f"drive unit up {uptime.seconds / 60:.0f} min this power cycle")
+    if extra:
+        line += "\n  " + "\n  ".join(extra)
+
+    state = data.get("state")
+    if state is not None and not state.ok:
+        line += (
+            f"\n  ! error {state.error_code}: {state.description}"
+            f"\n    {state.recommendation}"
+        )
+
     warning = data.get("layout_warning")
     return f"{line}\n  ! {warning}" if warning else line
 
@@ -281,6 +394,27 @@ def cmd_monitor(args) -> int:
         return 0
     finally:
         client.close()
+
+
+def _report_quality(quality, args, *, prefix: str = "") -> None:
+    """Print what the link lost, if anything. Silent on a clean capture.
+
+    This is deliberately loud. Both captures recorded before it existed were
+    damaged -- one lost 53% of its frames, the other recorded 2.2 s of bus
+    traffic as if it had taken 40 ms -- and in each case the tool printed a
+    cheerful summary and the next command consumed the file as if it were
+    whole.
+    """
+    warnings = quality.warnings()
+    if getattr(args, "json", False):
+        if warnings:
+            print(json.dumps({"link_quality": quality.to_dict()}, indent=2))
+        return
+    if not warnings:
+        return
+    print(f"\n{prefix}Problems with this capture:")
+    for warning in warnings:
+        print(f"  ! {warning}")
 
 
 def cmd_sniff(args) -> int:
@@ -317,11 +451,51 @@ def cmd_sniff(args) -> int:
         client.close()
         if writer is not None:
             writer.stop()
-            print(f"\nWrote {args.output}")
+            _report_capture(client, args)
+
+
+def _report_capture(client, args) -> None:
+    """Say what the capture actually contains, including when it contains nothing."""
+    if not client.quality.frames:
+        # Silence here used to look like success. It is the normal result of
+        # listen-only on a firmware that ignores the request, and of a bus that
+        # is simply not powered.
+        print(f"\nNo frames received. {args.output} is empty.")
+        if args.passive:
             print(
-                f"Turn it into a simulator profile with: "
-                f"bafang-can import-capture {args.output} -o profile.json"
+                "The adapter was asked for listen-only mode. Some slcan "
+                "firmware accepts the command and then receives nothing, "
+                "without reporting an error -- retry without --passive, or on "
+                "gs_usb, to tell that apart from an unpowered bus."
             )
+        else:
+            print(
+                "Check that the bike is powered, the CAN pair is the right way "
+                "round, and --bitrate matches."
+            )
+        return
+
+    print(f"\nWrote {args.output} ({client.quality.frames} frames)")
+    if client.listener_overflows:
+        print(
+            f"  ! {client.listener_overflows} messages were dropped before "
+            "reaching the display because it could not keep up. The log file is "
+            "unaffected. Re-run with --quiet to remove the bottleneck."
+        )
+    # Report on the file, not on the live counters. They can disagree, and when
+    # they do it is the file that is wrong and the file the user keeps: a
+    # capture whose timestamps the log writer clamped looked perfect live and
+    # arrived on disk with its clock frozen.
+    try:
+        written = analyse_log(args.output, bitrate=args.bitrate)
+    except Exception:  # pragma: no cover - fall back to what we measured live
+        log.debug("could not re-read %s", args.output, exc_info=True)
+        written = client.quality
+    _report_quality(written, args)
+    print(
+        f"\nTurn it into a simulator profile with: "
+        f"bafang-can import-capture {args.output} -o profile.json"
+    )
 
 
 class _TappedBus:
@@ -351,10 +525,10 @@ class _TappedBus:
 def cmd_errors(args) -> int:
     client, system = _connect(args)
     try:
-        device = _device(args.device) if args.device else DeviceId.DRIVE_UNIT
-        errors = system.errors(device)
+        device = _device(args.device) if args.device else None
+        errors, source = system.errors_with_source(device)
         if not errors:
-            print("No stored error codes.")
+            print(f"No stored error codes ({source.name} answered).")
         else:
             _print(
                 [
@@ -363,6 +537,13 @@ def cmd_errors(args) -> int:
                 ],
                 args.json,
             )
+            if not args.json and device is None and source is not DeviceId.DRIVE_UNIT:
+                print(
+                    f"\nRead from {source.name}, which is where this bus keeps "
+                    "the log -- the drive unit does not answer 60/07. A display "
+                    "can outlive several controllers, so an old entry here does "
+                    "not prove the current motor ever had that fault."
+                )
         if args.clear:
             if not args.apply:
                 print("\n--apply not given: error codes were NOT cleared.")
@@ -370,7 +551,7 @@ def cmd_errors(args) -> int:
             if not _confirm(args, "Clearing erases the stored fault history."):
                 print("Aborted.")
                 return 1
-            system.clear_errors(device)
+            system.clear_errors(device or source)
             print("Error codes cleared.")
         return 0
     finally:
@@ -576,7 +757,7 @@ def cmd_wheel(args) -> int:
             print("Aborted.")
             return 1
         system.write_speed_parameters(params)
-        print("Written.")
+        print("Written, and confirmed on the drive unit's own 32/03 broadcast.")
         return 0
     finally:
         client.close()
@@ -709,6 +890,11 @@ def cmd_import_capture(args) -> int:
     summary = profile.summary()
     print(f"Recovered {summary['responses']} answers from {args.file}")
     _print(summary["devices"], args.json)
+    _report_quality(
+        analyse_log(args.file, bitrate=args.bitrate),
+        args,
+        prefix="The source capture is incomplete. ",
+    )
     return 0
 
 
@@ -749,8 +935,6 @@ def cmd_decode(args) -> int:
 
 def cmd_decode_log(args) -> int:
     """Decode a recorded capture offline (candump, ASC, BLF, CSV, TRC)."""
-    import can
-
     known: dict[tuple[int, int], str] = {}
     for _table, entries in (("read", READ), ("write", WRITE)):
         for name, command in entries.items():
@@ -763,23 +947,26 @@ def cmd_decode_log(args) -> int:
                 known[key] = f"{existing}|{name}"
     rows = []
     counts: dict[str, int] = {}
-    with can.LogReader(args.file) as reader:
-        for message in reader:
-            if not message.is_extended_id:
-                continue
-            ident = BafangId.decode(message.arbitration_id)
-            label = known.get((ident.code, ident.subcode), "")
-            rows.append(
-                {
-                    "timestamp": round(message.timestamp, 4),
-                    "id": str(ident),
-                    "command": label,
-                    "data": bytes(message.data).hex(),
-                }
-            )
-            counts[f"{ident} {label}".strip()] = (
-                counts.get(f"{ident} {label}".strip(), 0) + 1
-            )
+    quality = analyse_log(args.file, bitrate=args.bitrate)
+    for can_id, data, timestamp in iter_frames(args.file):
+        # Corrupt identifiers are counted by the quality pass and dropped here.
+        # Decoding one produces a confident line about a device that does not
+        # exist on the bus, which is worse than not printing it at all.
+        if can_id > CAN_EFF_MASK:
+            continue
+        ident = BafangId.decode(can_id)
+        label = known.get((ident.code, ident.subcode), "")
+        rows.append(
+            {
+                "timestamp": round(timestamp, 4),
+                "id": str(ident),
+                "command": label,
+                "data": data.hex(),
+            }
+        )
+        counts[f"{ident} {label}".strip()] = (
+            counts.get(f"{ident} {label}".strip(), 0) + 1
+        )
     if args.summary:
         _print(
             [
@@ -788,6 +975,7 @@ def cmd_decode_log(args) -> int:
             ],
             args.json,
         )
+        _report_quality(quality, args)
         return 0
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -797,6 +985,7 @@ def cmd_decode_log(args) -> int:
                 f"{row['timestamp']:14.4f} {row['id']:<44} "
                 f"{row['command']:<26} {row['data']}"
             )
+    _report_quality(quality, args)
     return 0
 
 

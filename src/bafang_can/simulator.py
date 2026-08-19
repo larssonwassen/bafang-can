@@ -17,8 +17,10 @@ Provenance -- what is real here and what is invented
   independently verified -- ``tests/test_differential_write.py`` proves the
   frames this package emits are byte-identical to the vendor serializer's.
 * **Which commands answer: from the merged command table.** 0x60/0x17 and
-  0x60/0x18 deliberately return ERROR_ACK so ``probe`` shows a realistic mix
-  of supported and unsupported commands.
+  0x60/0x18 deliberately return ERROR_ACK, the codes in ``SILENT_READS``
+  deliberately return nothing at all, and those in ``EMPTY_READS`` return a
+  transfer of length zero, so ``probe`` shows all four outcomes a real bus
+  produces -- answered, empty, refused, and silent.
 * **The field values: invented.** They are plausible numbers for a 250 W /
   36 V mid-drive, not a capture from a real M200. The identity strings
   ("M200.G210", "CRX10.M200.1.0") are made up. Nothing here should be used to
@@ -51,6 +53,27 @@ from .frame import BafangId, checksum, int_to_bytes_le
 
 #: How long a simulated device takes to answer, in seconds.
 LATENCY = 0.002
+
+#: Read commands the simulated bike ignores completely, rather than declining.
+#:
+#: A real firmware does both, and they mean different things: ERROR_ACK says a
+#: handler exists and said no, silence says nothing handled the request. An
+#: unassigned code on the parameter page is here so the probe's control has
+#: something honest to measure against.
+SILENT_READS: frozenset[tuple[int, int]] = frozenset({
+    (0x60, 0x7F),  # unassigned -- the probe's control
+    (0x62, 0xD9),  # ControllerStartupAngle
+})
+
+#: Read commands answered with a well-formed transfer carrying no bytes.
+#:
+#: The fourth thing a real firmware does, and the one a three-way probe hid. A
+#: real G210 answers ``60/06`` with ``MULTIFRAME_START`` declaring a length of
+#: zero followed straight by ``MULTIFRAME_END``: the handler is there and the
+#: value is blank. That is neither an answer worth printing nor an absence.
+EMPTY_READS: frozenset[tuple[int, int]] = frozenset({
+    (0x60, 0x06),  # SystemParams -- observed empty on a real M200
+})
 
 
 def _block(values: dict[int, int]) -> bytearray:
@@ -419,12 +442,20 @@ class SimBus:
 
     # -- protocol behaviour --------------------------------------------------
 
-    def _emit(self, source: int, operation: int, code: int, subcode: int, data: bytes) -> None:
+    def _emit(
+        self,
+        source: int,
+        operation: int,
+        code: int,
+        subcode: int,
+        data: bytes,
+        target: int = int(DeviceId.TOOL),
+    ) -> None:
         import can
 
         ident = BafangId(
             source=source,
-            target=int(DeviceId.TOOL),
+            target=target,
             operation=operation,
             code=code,
             subcode=subcode,
@@ -459,6 +490,19 @@ class SimBus:
                 if payload is None:
                     payload = self.blocks.get(key)
             if payload is None:
+                if (ident.code, ident.subcode) in EMPTY_READS:
+                    self._emit(
+                        target, CanOperation.MULTIFRAME_START,
+                        ident.code, ident.subcode, b"\x00",
+                    )
+                    self._emit(target, CanOperation.MULTIFRAME_END, 0x00, 0x00, b"")
+                    return
+                if (ident.code, ident.subcode) in SILENT_READS:
+                    # Deliberately no answer at all, so `probe` can show the
+                    # difference between a firmware that declines a command and
+                    # one that has no handler for it. Both looked identical
+                    # until the probe started reporting them apart.
+                    return
                 self._emit(target, CanOperation.ERROR_ACK, ident.code, ident.subcode, b"\x00")
                 return
             self._send_payload(target, ident.code, ident.subcode, bytes(payload))
@@ -511,6 +555,28 @@ class SimBus:
         self.blocks[key] = bytearray(data)
         self._save_state()
         self._emit(target, CanOperation.NORMAL_ACK, ident.code, ident.subcode, b"\x00")
+        self._echo_broadcast(target, ident, bytes(data))
+
+    #: Codes the drive unit re-broadcasts after accepting a write to them.
+    #:
+    #: A real G210 answers a 32/03 write with NORMAL_ACK after 5 ms and then
+    #: puts the new value on its own 2.004 s broadcast 300 ms later. That
+    #: broadcast is the only way to confirm the write, because this firmware
+    #: will not answer a read of 32/03 -- so the simulator has to produce it or
+    #: the verification path is never exercised off the bike.
+    BROADCAST_AFTER_WRITE: frozenset[tuple[int, int]] = frozenset({(0x32, 0x03)})
+
+    def _echo_broadcast(self, source: int, ident: BafangId, data: bytes) -> None:
+        if (ident.code, ident.subcode) not in self.BROADCAST_AFTER_WRITE:
+            return
+        self._emit(
+            source,
+            CanOperation.WRITE_CMD,
+            ident.code,
+            ident.subcode,
+            data,
+            target=int(DeviceId.BROADCAST),
+        )
 
     def _send_payload(self, source: int, code: int, subcode: int, payload: bytes) -> None:
         if len(payload) <= 8:

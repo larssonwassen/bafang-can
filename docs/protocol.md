@@ -4,6 +4,15 @@ Reconstructed from the two vendored projects and expressed in
 `src/bafang_can/frame.py`, `commands.py` and `protocol.py`. Nothing here comes
 from official Bafang documentation.
 
+The closest approach to it is second-hand:
+[`OpenSourceEBike/Bafang_M500_M600`](https://github.com/OpenSourceEBike/Bafang_M500_M600)
+pulled the command table out of the BESST desktop application's own JavaScript,
+so those *names, codes and subcodes* originate with Bafang even though no
+layouts do. It independently agrees with this document on the identifier
+layout, the node addresses and all eight operation codes. Sixteen of its codes
+are in `commands.py` marked `BESST only`, with no payload decoding and with
+device applicability inferred rather than observed.
+
 ## Physical layer
 
 | Property | Value |
@@ -122,8 +131,27 @@ before writing anything voltage related.
 | --- | --- |
 | 0x32/0x00 | SOC %, trip (0.01 km), cadence, torque (u16), remaining range (0.01 km, 0xFFFF = unknown) |
 | 0x32/0x01 | speed (0.01 km/h), current (0.01 A), voltage (0.01 V), controller °C+40, motor °C+40 (0xFF = none) |
-| 0x31/0x00 | torque sensor: torque u16, cadence |
+| 0x31/0x00 | torque sensor: torque u16, cadence, rolling frame counter (byte 3) |
 | 0x34/0x01 | battery: current (signed 0.01 A), voltage (0.01 V), °C+40 |
+| 0x12/0x00 | drive unit: live fault code — **disputed**, see below |
+| 0x30/0x00 | drive unit: uptime, LE u32 of ~10.026 s ticks since power-on |
+| 0x63/0x00 | display → drive unit at 100 Hz: assist levels, level code, buttons |
+| 0x63/0x03 | display → drive unit: idle minutes before shutdown |
+
+`0x31/0x00` byte 3 and `0x30/0x00` are decoded here and in no vendored
+project. `0x63/0x00` and `0x63/0x03` are pushed by the display without being
+asked, so they are readable in listen-only mode.
+
+### A second layout disagreement, on 0x12/0x00
+
+This tool reads the single byte as a **live fault code**: it held `07` on a
+bike displaying error 07 and `00` after the fault was repaired, with the
+display echoing the same value on `0x13/0x00`.
+`OpenSourceEBike/Bafang_M500_M600` reads it as a **bitfield** — bit 0 brake,
+bit 1 motor stopped, bit 2 undervoltage. Both agree that zero is healthy and
+they cannot both be right above that. Squeezing the brake lever while
+capturing separates them; nobody has done it. `codecs.ControllerState` records
+the dispute.
 
 ## Error codes
 

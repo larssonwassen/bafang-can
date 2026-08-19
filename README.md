@@ -15,7 +15,14 @@ The two existing open-source Bafang tools each solve half of this problem:
   calibration, firmware update) — but is a web UI wrapped around a server.
 
 Both are vendored here as submodules under `vendor/` and are the reference for
-everything in `src/`. This repository is a single scriptable Python CLI that
+everything in `src/`. A third source is used but not vendored:
+[`OpenSourceEBike/Bafang_M500_M600`](https://github.com/OpenSourceEBike/Bafang_M500_M600),
+which extracted the command table out of the **BESST desktop application's own
+JavaScript** and published PCAN logs of an M500 powering up and down. That is
+the closest thing to a vendor list anyone has released; it contributes sixteen
+command codes neither vendored project implements, corroborates three things
+this project had decoded on its own, and disagrees with it about one — see
+"Cross-referencing the M500/M600 work" in [docs/m200.md](docs/m200.md). This repository is a single scriptable Python CLI that
 takes the protocol knowledge from both, drops the BESST hardware requirement,
 and adds the parts a workshop session actually needs: capability probing,
 JSON backup/restore, verified read-modify-write, and per-motor safety limits.
@@ -118,7 +125,7 @@ tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 
 ## Validation
 
-Run `pytest` (118 tests, ~27 s). Seven layers, described in
+Run `pytest` (238 tests, ~77 s). Eight layers, described in
 [docs/testing.md](docs/testing.md):
 
 1. Unit tests for identifiers, checksums, offsets and scaling.
@@ -130,11 +137,16 @@ Run `pytest` (118 tests, ~27 s). Seven layers, described in
    this tool emits are byte-identical to the vendor serializer's. This also
    found a missing field (`speed_limit_enabled`, Parameter1 byte 36).
 4. End-to-end CLI tests against the built-in simulator.
-5. Bench tests on a real adapter with no bike attached, which settled how the
+5. Assertions against **two real captures of one G210**, faulty and repaired,
+   kept in `tests/data`. Two nodes independently reporting the same charge and
+   the same torque check the codecs in a way no shared bug can fake; the pair
+   is what establishes the live fault code; and one is damaged and one is clean,
+   so the capture-integrity checks are tested in both directions.
+6. Bench tests on a real adapter with no bike attached, which settled how the
    firmware is identified and made `sniff --passive` genuinely passive.
-6. A session on a real bike, which proved the transport and addressing and
+7. A session on a real bike, which proved the transport and addressing and
    found that one realtime block does *not* match this generation.
-7. Hardware loopback on a gs_usb adapter, where frames this tool emits are
+8. Hardware loopback on a gs_usb adapter, where frames this tool emits are
    transmitted and read back byte for byte — the transmit path, finally.
 
 ## What one real bike showed
@@ -152,7 +164,8 @@ pointing this at similar hardware:
 * That firmware **answers identity reads only** — 5 of 16 known commands. No
   parameter block, no realtime read, no stored error code, from any source id.
   It does however **broadcast** the realtime data it will not answer, which is
-  what `monitor --passive` reads.
+  what `monitor --passive` reads — including the **live fault code**, settled by
+  capturing the same bike faulty and repaired (`07` then `00` on `12/00`).
 * Its `ControllerRealtime1` voltage field read **51.0 V while the battery
   independently reported 37.4 V** on a 36 V pack. That disagreement, surfaced
   by `monitor --passive`, turned out to be a real hardware fault rather than a
@@ -165,6 +178,71 @@ pointing this at similar hardware:
   answers along the way. `ControllerRealtime0` passed the equivalent check,
   its torque field agreeing with the torque sensor's own broadcast to within
   four counts.
+* Both captures from that session were **damaged, and nothing said so**. One
+  lost 53% of its frames; the other recorded 2.2 s of bus traffic as if it had
+  taken 40 ms, having drained a stale serial buffer rather than read the wire.
+  Neither is visible by looking at the file. The torque sensor numbers its
+  broadcasts, so loss is provable rather than inferred, and `sniff`,
+  `decode-log` and `import-capture` now report it —
+  see [docs/hardware.md](docs/hardware.md#frame-loss-on-slcan).
+* The tool described **24 error codes as undocumented that were vendored here
+  all along**, code 7 among them. That is the code this bike displayed for the
+  entire overvoltage investigation, and it means "over voltage protection".
+  `bafang_canable_pro` carries 33 descriptions with recommendations;
+  `OpenBafangTool` carries 3. Both are now merged — and on code 14 they
+  genuinely disagreed. The vehicle manual — a third source, and the only one
+  authoritative for this bike — settles it as controller overtemperature, and
+  supplies more actionable text for eight other codes.
+
+* **The bike is deliberately restricted — in the display, not the protocol.**
+  The vehicle manual states that wheel size, speed and assist levels are
+  *locked*, so the brand really did restrict it. But that lock is a menu that
+  declines to change them: the drive unit broadcasts those same values unasked
+  every two seconds and accepts writes to them. The manual's figures, 28″ and
+  25 km/h, are exactly what the `32/03` decode produces — two documents sharing
+  no code path agreeing on both fields.
+* **Nothing on the bus itself looks locked.** Across 42000
+  captured frames there is no challenge, no nonce, no high-entropy payload and
+  no authentication of any kind; the assist-level encoding, the fault-code
+  table and the model string are all stock Bafang. The one identity exchange is
+  a single boot-time read of the drive unit's serial number by the display,
+  which stops once answered — pairing check and part-number lookup are
+  indistinguishable from one bike. The real obstacle to swapping a part is that
+  this firmware answers **no parameter block**, so a replacement has to arrive
+  already configured.
+* **That silence is not a refusal.** `probe` now separates ERROR_ACK from
+  no-answer instead of collapsing both to "unsupported", and probes an
+  unassigned code as a control. Measured across all three nodes — drive unit,
+  torque sensor and display — there is **not one ERROR_ACK on the bus**: every
+  unanswered command behaves exactly like a command that does not exist. The
+  torque sensor, a different product with no tuning surface worth locking,
+  shows the identical pattern, which is hard to reconcile with a
+  derestriction lock and easy to reconcile with a protocol generation that
+  pushes rather than answers.
+* **The bike is configurable after all, for the two settings that matter.**
+  The drive unit will not answer a `32/03` read — and it *broadcasts* `32/03`
+  every two seconds, and the write command for wheel size and speed limit is
+  that same `32/03`. `wheel` was unusable here only because it started with a
+  read that timed out; it now falls back to the broadcast. This is also what
+  owners fitting a generic Bafang display are seeing: such a display writes
+  those values, it never needed to read them.
+* **The stored fault log was on the display, and the tool never asked.** The
+  drive unit does not answer `60/07`, so this was recorded as "no readable
+  fault log". The `DP C340.C` answers it with the full history — on this bike a
+  stored **code 7, over voltage protection**, the exact fault of the
+  investigation above, plus a keypad-circuit code. `errors` and `diagnose` now
+  ask both and report which answered. The reasoning and the
+  experiment that would settle it are in
+  [docs/m200.md](docs/m200.md#what-the-bus-does-at-power-on-and-the-question-of-a-locked-firmware).
+
+The bus turned out to carry far more unasked than the tool was reading. Eleven
+message types decode — including pack capacity and state of health, charge-cycle
+count, the wheel and speed-limit configuration, and a drive-unit uptime counter
+that dates a capture's power-on instant and so catches a damaged clock without
+trusting the host — and twelve more are recorded undecoded so the next person
+starts from evidence.
+[docs/m200.md](docs/m200.md#what-the-bus-carries-unasked) lists all twenty-three
+with periods, payloads and the cross-checks that confirm them.
 
 ## Status and honesty about the M200
 

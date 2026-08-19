@@ -32,6 +32,7 @@ from typing import Callable
 from .commands import Command
 from .constants import CanOperation, DeviceId
 from .frame import BafangId, BafangMessage
+from .quality import LinkQuality
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ DEFAULT_TIMEOUT = 2.0
 #: arrive faster than this.
 INTERFRAME_DELAY = 0.02
 MULTIFRAME_TIMEOUT = 3.0
+#: How many messages may sit between the receive thread and the listeners.
+#: A Bafang bus runs at about 165 frames/s, so this is roughly a minute of
+#: backlog -- far more than any transient stall, and bounded so a listener
+#: that has stopped consuming cannot exhaust memory.
+LISTENER_QUEUE_SIZE = 10_000
 
 
 class BafangError(RuntimeError):
@@ -96,6 +102,14 @@ class BafangClient:
         self._listeners: list[Callable[[BafangMessage], None]] = []
         self._stop = threading.Event()
         self._rx_thread: threading.Thread | None = None
+        self._emit_thread: threading.Thread | None = None
+        self._emit_queue: queue.Queue[BafangMessage] = queue.Queue(
+            maxsize=LISTENER_QUEUE_SIZE
+        )
+        #: What this session received, and what it lost getting it.
+        self.quality = LinkQuality()
+        #: Messages dropped because the listeners could not keep up.
+        self.listener_overflows = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -103,6 +117,17 @@ class BafangClient:
         if self._rx_thread is not None:
             return self
         self._stop.clear()
+        # Two threads on purpose. The receive thread must do nothing but drain
+        # the adapter: a listener that prints a line or writes to a log file is
+        # slower than the bus, and on slcan -- where python-can reads the
+        # serial port one byte at a time -- a stalled reader overflows the tty
+        # buffer and the kernel discards frames that already arrived. A capture
+        # made this way lost 53% of the torque sensor's broadcasts. Handing
+        # messages to a second thread keeps the reader tight against the wire.
+        self._emit_thread = threading.Thread(
+            target=self._emit_loop, name="bafang-emit", daemon=True
+        )
+        self._emit_thread.start()
         self._rx_thread = threading.Thread(
             target=self._rx_loop, name="bafang-rx", daemon=True
         )
@@ -114,6 +139,9 @@ class BafangClient:
         if self._rx_thread is not None:
             self._rx_thread.join(timeout=2.0)
             self._rx_thread = None
+        if self._emit_thread is not None:
+            self._emit_thread.join(timeout=2.0)
+            self._emit_thread = None
 
     def close(self) -> None:
         self.stop()
@@ -131,6 +159,13 @@ class BafangClient:
     def add_listener(self, callback: Callable[[BafangMessage], None]) -> None:
         """Register a callback for every message, including foreign traffic."""
         self._listeners.append(callback)
+
+    def remove_listener(self, callback: Callable[[BafangMessage], None]) -> None:
+        """Unregister a callback. Silently ignores one that is not registered."""
+        try:
+            self._listeners.remove(callback)
+        except ValueError:
+            pass
 
     # -- low level ------------------------------------------------------
 
@@ -159,6 +194,20 @@ class BafangClient:
                 self._expire_buffers()
                 continue
             if not message.is_extended_id or message.is_error_frame:
+                continue
+            # Corrupt frames are not a theoretical concern: python-can's slcan
+            # backend parses the identifier with int(text, 16) and no range
+            # check, so one dropped serial byte resynchronises mid-frame and
+            # produces an identifier wider than the 29 bits CAN has.
+            # BafangId.decode would mask it into a plausible message from a
+            # device that does not exist.
+            if not self.quality.observe(
+                message.arbitration_id, bytes(message.data), message.timestamp
+            ):
+                log.debug(
+                    "dropped a frame with an impossible identifier %#x",
+                    message.arbitration_id,
+                )
                 continue
             # gs_usb echoes our own transmissions back with is_rx False. The
             # source check in _handle catches them too, but only while we are
@@ -249,15 +298,77 @@ class BafangClient:
                 log.warning("multi-frame transfer %s timed out, discarding", key)
                 del self._buffers[key]
 
+    #: Operations a device uses to answer a request addressed to it.
+    #:
+    #: Reassembled multi-frame answers are delivered carrying the identifier of
+    #: their ``MULTIFRAME_START``, which is why that is an answer operation
+    #: here while ``MULTIFRAME`` and ``MULTIFRAME_END`` are not.
+    ANSWER_OPERATIONS = frozenset({
+        CanOperation.NORMAL_ACK,
+        CanOperation.ERROR_ACK,
+        CanOperation.MULTIFRAME_START,
+    })
+
     def _deliver(self, message: BafangMessage) -> None:
-        key = (message.id.source, message.id.code, message.id.subcode)
-        with self._lock:
-            pending = self._pending.get(key)
-        if pending is not None:
-            pending.queue.put(message)
+        """Route a received message to whoever is waiting for it.
+
+        A pending request is only satisfied by a message **addressed to this
+        tool** with an answer operation. Both halves of that matter, and the
+        target check is the one that was missing.
+
+        The drive unit broadcasts ``32/03`` to 0x1F every 2.004 s, and
+        ``32/03`` is also the code a speed-parameter write is sent to. Keying
+        pending requests on source, code and subcode alone let that broadcast
+        satisfy the write and be reported as an acknowledgement -- so a write
+        this firmware ignored would still have been reported as successful, as
+        long as it arrived within a couple of seconds of a broadcast. That is
+        the precise opposite of what "verified write" is supposed to mean, and
+        it applied to the one field ``wheel`` writes.
+
+        Nothing about the listener path changes: broadcasts still reach
+        listeners, which is how ``read_speed_parameters`` falls back to reading
+        ``32/03`` off the wire when the drive unit will not answer a read.
+        """
+        answers_us = (
+            message.id.target == self.source
+            and message.id.operation in self.ANSWER_OPERATIONS
+        )
+        if answers_us:
+            key = (message.id.source, message.id.code, message.id.subcode)
+            with self._lock:
+                pending = self._pending.get(key)
+            if pending is not None:
+                pending.queue.put(message)
         self._emit(message)
 
     def _emit(self, message: BafangMessage) -> None:
+        """Hand a message to the listener thread. Never blocks the receiver."""
+        if not self._listeners:
+            return
+        try:
+            self._emit_queue.put_nowait(message)
+        except queue.Full:
+            # Dropping here is a last resort, but it is a drop we can count and
+            # report, which is strictly better than stalling the receive thread
+            # and losing frames silently at the adapter instead.
+            self.listener_overflows += 1
+
+    def _emit_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                message = self._emit_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self._dispatch(message)
+        # Drain whatever arrived before the stop, so a capture that ends on a
+        # burst still writes every frame it received.
+        while True:
+            try:
+                self._dispatch(self._emit_queue.get_nowait())
+            except queue.Empty:
+                return
+
+    def _dispatch(self, message: BafangMessage) -> None:
         for listener in list(self._listeners):
             try:
                 listener(message)
@@ -426,12 +537,23 @@ class BafangClient:
             return self.write_long(target, command, data, **kwargs)
         return self.write_short(target, command, data, **kwargs)
 
-    def ping(self, target: int, timeout: float = 0.6) -> bool:
-        """True when the device answers a hardware-version read."""
+    def ping(self, target: int, timeout: float = 0.6, retries: int = 2) -> bool:
+        """True when the device answers a hardware-version read.
+
+        This retries where most reads do not, because the two failure modes are
+        not symmetrical. A missed answer here reports a device as absent, and
+        ``diagnose`` turns that into "check CAN-H/CAN-L wiring and polarity" --
+        sending someone after a fault in a harness that is fine. A single
+        attempt lost a `DP C340.CAN` on one run in six against a bus already
+        carrying 166 broadcasts a second; three attempts have not lost it.
+
+        The cost is bounded and only paid when a device really is absent: a
+        node that answers does so on the first attempt.
+        """
         from .commands import READ
 
         try:
-            self.read(target, READ["HardwareVersion"], timeout=timeout, retries=0)
+            self.read(target, READ["HardwareVersion"], timeout=timeout, retries=retries)
             return True
         except BafangError:
             return False
