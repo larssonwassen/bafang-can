@@ -132,6 +132,24 @@ reports 51.50 V while the battery reports 37.47 V. That is a real hardware
 fault, kept in the fixture so the warning that reports it stays tested. See
 [m200.md](m200.md#diagnosing-an-overvoltage-fault-a-worked-case).
 
+**And against a bike that is moving.** Every fixture above was recorded on a
+stand or off a bench supply, which leaves out road load, a pack delivering
+current, and any speed worth the name. The three `tests/data/ride-*.log`
+excerpts are from one 102 s road ride with the pack fitted, and
+`tests/test_ride.py` asserts what only a moving bike can show:
+
+| check | what it establishes |
+| --- | --- |
+| 8 error frames in 2.1 s, at 15.1 A with the pack sagging 3 V | the bus fails under motor load, and error frames are the only trace |
+| the same adapter three seconds later, clean | the detector accepts good input as well as rejecting bad |
+| 11--13 A sustained through 25.5, 25.9, 26.6 km/h | a written speed limit changes motor behaviour, not just a readable field |
+| battery and drive unit both report 52% SOC, and agree on voltage to 0.5% | the repaired voltage-sense path, held in place by a regression test |
+| `32/08` non-zero at 0.0 A motor current, zero at 25 km/h with no pedalling | the field is rider-side, and is deliberately still not decoded |
+
+The ride log as a whole is clean -- 16807 frames, no loss, no duplicates, no
+impossible timing -- which is the gs_usb receive path validated at road speed
+rather than on a desk.
+
 ## 6. On the adapter, with no bike attached
 
 An adapter on the bench, with nothing wired to CAN-H/CAN-L, still settles

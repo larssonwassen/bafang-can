@@ -137,10 +137,40 @@ before writing anything voltage related.
 | 0x30/0x00 | drive unit: uptime, LE u32 of ~10.026 s ticks since power-on |
 | 0x63/0x00 | display → drive unit at 100 Hz: assist levels, level code, buttons |
 | 0x63/0x03 | display → drive unit: idle minutes before shutdown |
+| 0x32/0x08 | drive unit: rider-side power-like value, LE u16 — **units unclaimed**, see below |
 
 `0x31/0x00` byte 3 and `0x30/0x00` are decoded here and in no vendored
 project. `0x63/0x00` and `0x63/0x03` are pushed by the display without being
 asked, so they are readable in listen-only mode.
+
+### What 0x32/0x08 is, and what it is not
+
+Two bytes, little-endian, broadcast every 201 ms, in no published table. A road
+ride settles two of the obvious readings and neither is right. It is not motor
+power: through a coast-down the drive unit reports 0.0 A for every sample while
+the field still reads 42 and then 34. It is not speed: it reads 0 while the
+bike rolls at 25 km/h. It falls to zero when pedal torque returns to its
+resting value, so it is rider-side, and it reads like watts — 581 at the peak
+of that ride.
+
+The scale is deliberately not claimed and the field is not decoded. Fitting it
+against `(torque - rest) * cadence` gives a coefficient spanning an order of
+magnitude, because `0x31/0x00` torque is instantaneous within a pedal stroke
+and this is not. `docs/m200.md` has the numbers.
+
+### Error frames are not Bafang frames
+
+An adapter reports a malformed frame on the wire as a CAN error frame: no
+node sent it, the payload is error-class detail, and decoding it as a Bafang
+message produces a plausible-looking answer from a device that does not exist.
+`bafang_can.quality` counts them separately from corrupt identifiers and
+`bafang_can.capture` keeps them out of device profiles.
+
+A candump log cannot carry the error class. python-can writes the single
+identifier `20000080` — `CAN_ERR_FLAG | CAN_ERR_BUSERROR` — for every error
+frame whatever the controller reported, so offline the class is unknown and
+only the payload detail survives. Live, the class bits arrive in the
+identifier and the report is specific.
 
 ### A second layout disagreement, on 0x12/0x00
 

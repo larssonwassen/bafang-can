@@ -85,6 +85,7 @@ def _connect(args, *, listen_only: bool = False) -> tuple[BafangClient, BafangSy
             "pedalling": not args.sim_idle,
             "state_path": args.sim_state,
             "profile": args.sim_profile,
+            "replay": args.sim_replay,
         }
         extra = {k: v for k, v in extra.items() if v is not None}
     config = AdapterConfig(
@@ -289,6 +290,14 @@ def cmd_diagnose(args) -> int:
         except (BafangError, codecs.DecodeError) as exc:
             report["parameter1"] = f"not readable: {exc}"
         report["display"] = system.display_data()
+        # Everything above took a few seconds of bus traffic to answer. If the
+        # controller reported an error frame in that window, or the link lost
+        # broadcasts, the numbers above were read across a bus that is not well
+        # -- and that is worth saying next to them rather than in a separate
+        # command the user has to know to run.
+        if client.quality.bus_errors or not client.quality.healthy:
+            report["link"] = client.quality.to_dict()
+            report["link_problems"] = client.quality.warnings()
         report["checklist"] = list(m200.DIAGNOSTIC_STEPS)
         _print(report, args.json)
         return 0
@@ -1063,6 +1072,14 @@ def _add_global_options(parser: argparse.ArgumentParser, defaults: bool) -> None
         help="with --interface sim: a device profile recorded from a real "
         "bike (see 'capture' and 'import-capture'), used instead of the "
         "invented default answers",
+    )
+    parser.add_argument(
+        "--sim-replay",
+        default=default(None),
+        help="with --interface sim: a passive capture (candump or any format "
+        "python-can reads) played back as the bike's own broadcasts, at its "
+        "recorded pace, on a loop -- so a recorded ride can drive 'monitor' "
+        "and 'sniff' with no bike attached",
     )
     parser.add_argument(
         "--sim-state",

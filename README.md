@@ -75,6 +75,14 @@ bafang-can import-capture ride.log -o m200.json  # or rebuild it from a sniff
 bafang-can --interface sim --sim-profile m200.json diagnose
 ```
 
+Replaying a recorded ride, which needs no profile and no bike — the frames are
+put back on a simulated bus at the pace they were recorded, on a loop:
+
+```bash
+bafang-can --interface sim --sim-replay ride.log monitor --passive
+bafang-can --interface sim --sim-replay ride.log sniff
+```
+
 Changing things — every write is a dry run until `--apply`:
 
 ```bash
@@ -125,7 +133,7 @@ tests/            unit, round-trip, differential (vs vendored JS) and CLI tests
 
 ## Validation
 
-Run `pytest` (238 tests, ~77 s). Eight layers, described in
+Run `pytest` (270 tests, ~81 s). Eight layers, described in
 [docs/testing.md](docs/testing.md):
 
 1. Unit tests for identifiers, checksums, offsets and scaling.
@@ -137,11 +145,13 @@ Run `pytest` (238 tests, ~77 s). Eight layers, described in
    this tool emits are byte-identical to the vendor serializer's. This also
    found a missing field (`speed_limit_enabled`, Parameter1 byte 36).
 4. End-to-end CLI tests against the built-in simulator.
-5. Assertions against **two real captures of one G210**, faulty and repaired,
-   kept in `tests/data`. Two nodes independently reporting the same charge and
-   the same torque check the codecs in a way no shared bug can fake; the pair
-   is what establishes the live fault code; and one is damaged and one is clean,
-   so the capture-integrity checks are tested in both directions.
+5. Assertions against **real captures of one G210**, kept in `tests/data`:
+   faulty and repaired on the bench, plus three excerpts of a 102 s road ride
+   with the pack fitted. Two nodes independently reporting the same charge and
+   the same torque check the codecs in a way no shared bug can fake; the
+   bench pair is what establishes the live fault code; and the ride is where
+   the bus errors, the battery under load and the speed limit's real effect
+   on the motor come from.
 6. Bench tests on a real adapter with no bike attached, which settled how the
    firmware is identified and made `sniff --passive` genuinely passive.
 7. A session on a real bike, which proved the transport and addressing and

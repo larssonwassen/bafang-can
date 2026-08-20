@@ -33,8 +33,13 @@ this module. That is why the differential tests exist -- the vendored
 JavaScript is the external oracle. Tests here cover wiring and CLI behaviour;
 correctness of the byte layouts is established elsewhere.
 
-Replacing this with a recorded capture from a real bike (see
-``bafang-can sniff`` and ``decode-log``) would be a strict improvement.
+Two ways to stop inventing. ``--sim-profile`` replaces the answers to service
+reads with ones a real bike gave. ``--sim-replay`` goes further for the passive
+path: it puts a recorded capture back on the bus at its recorded pace, looping,
+so ``monitor --passive`` and ``sniff`` see bytes a real G210 sent rather than
+anything from this file. Only the bike's own traffic is replayed -- a recorded
+answer addressed to the tool would satisfy a request nobody in this session
+made -- and error frames are dropped rather than reproduced.
 """
 
 from __future__ import annotations
@@ -49,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .constants import CanOperation, DeviceId, wheel_by_text
-from .frame import BafangId, checksum, int_to_bytes_le
+from .frame import CAN_EFF_MASK, BafangId, checksum, int_to_bytes_le
 
 #: How long a simulated device takes to answer, in seconds.
 LATENCY = 0.002
@@ -208,6 +213,7 @@ class SimBus:
         chatter: bool = True,
         state_path: str | None = None,
         profile: str | None = None,
+        replay: str | None = None,
     ) -> None:
         self.rx: queue.Queue = queue.Queue()
         self.sent: list = []
@@ -227,9 +233,14 @@ class SimBus:
         self._load_state()
         self._stop = threading.Event()
         self._chatter: threading.Thread | None = None
+        self.replay_source = ""
+        self.replay_frames: list[tuple[int, bytes, float]] = []
+        if replay:
+            self._load_replay(replay)
         if chatter:
+            target = self._replay_loop if self.replay_frames else self._chatter_loop
             self._chatter = threading.Thread(
-                target=self._chatter_loop, name="sim-chatter", daemon=True
+                target=target, name="sim-chatter", daemon=True
             )
             self._chatter.start()
 
@@ -283,6 +294,69 @@ class SimBus:
             "errors": self.errors,
         }
         self.state_path.write_text(json.dumps(payload, indent=2))
+
+    # -- replaying a recorded ride ------------------------------------------
+
+    #: A recorded gap longer than this is shortened to it. A passive log can
+    #: contain a pause of any length -- the rider stopping at a light, the
+    #: recorder being started early -- and replaying that faithfully means a
+    #: replay that appears to hang.
+    MAX_REPLAY_GAP = 1.0
+
+    def _load_replay(self, path: str) -> None:
+        """Read a passive capture to be played back as the bike's own traffic.
+
+        Only frames the bike sent to itself are kept. A recorded answer to the
+        *tool* would arrive unbidden, out of order with whatever this session
+        is actually asking for, and satisfy a request that had not been made;
+        service reads keep being answered by the simulator, from a device
+        profile where one is loaded.
+
+        Error frames are dropped rather than replayed. They are not messages
+        from a node, and reproducing the bus errors of an old ride in a
+        session that has no bus would be inventing a fault.
+        """
+        from .quality import CAN_ERROR_STAMP, iter_frames
+
+        tool = int(DeviceId.TOOL)
+        frames: list[tuple[int, bytes, float]] = []
+        for can_id, data, timestamp in iter_frames(path):
+            if can_id == CAN_ERROR_STAMP or can_id > CAN_EFF_MASK:
+                continue
+            if BafangId.decode(can_id).target == tool:
+                continue
+            frames.append((can_id, bytes(data), timestamp))
+        self.replay_frames = frames
+        self.replay_source = path
+
+    def _replay_loop(self) -> None:
+        """Put a recorded capture back on the bus at its recorded pace.
+
+        Looping, because a capture ends and a bus does not. The seam between
+        the last frame and the first is a discontinuity -- counters jump back,
+        speed teleports -- so anything reading a replay for more than one pass
+        should expect it.
+        """
+        import can
+
+        while not self._stop.is_set():
+            previous: float | None = None
+            for can_id, data, timestamp in self.replay_frames:
+                if previous is not None:
+                    gap = min(max(timestamp - previous, 0.0), self.MAX_REPLAY_GAP)
+                    if self._stop.wait(gap):
+                        return
+                previous = timestamp
+                self.rx.put(
+                    can.Message(
+                        arbitration_id=can_id,
+                        data=data,
+                        is_extended_id=True,
+                        timestamp=time.time(),
+                    )
+                )
+            if self._stop.wait(self.MAX_REPLAY_GAP):
+                return
 
     def _chatter_loop(self) -> None:
         """Traffic between the bike's own nodes, addressed to neither of us.
