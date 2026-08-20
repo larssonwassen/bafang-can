@@ -30,6 +30,7 @@ from typing import Any
 from .commands import READ
 from .constants import CanOperation, DeviceId
 from .frame import CAN_EFF_MASK, BafangId, BafangMessage
+from .quality import CAN_ERROR_STAMP
 
 FORMAT = "bafang-can-device-profile"
 VERSION = 1
@@ -170,7 +171,16 @@ def assemble(messages: Iterable[Any], tool: int = int(DeviceId.TOOL)) -> Iterato
     buffers: dict[tuple[int, int], dict[str, Any]] = {}
 
     for message in messages:
+        if getattr(message, "is_error_frame", False):
+            # The controller reporting a malformed frame on the wire, not a
+            # message from a node. Its payload is error-class detail and
+            # decodes as nonsense. quality.LinkQuality is what counts these.
+            continue
         if not getattr(message, "is_extended_id", False):
+            continue
+        if message.arbitration_id == CAN_ERROR_STAMP:
+            # The same thing arriving from a candump log, where python-can
+            # writes one fixed identifier for every error frame.
             continue
         if message.arbitration_id > CAN_EFF_MASK:
             # A corrupt identifier from a resynchronising slcan reader.

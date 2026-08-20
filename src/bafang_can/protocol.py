@@ -193,7 +193,24 @@ class BafangClient:
             if message is None:
                 self._expire_buffers()
                 continue
-            if not message.is_extended_id or message.is_error_frame:
+            if message.is_error_frame:
+                # Not a message from a node: the controller reporting that a
+                # frame on the wire was malformed. Counted rather than
+                # discarded, because on this bike they arrive in bursts under
+                # motor load and that is worth knowing about.
+                self.quality.observe(
+                    message.arbitration_id,
+                    bytes(message.data),
+                    message.timestamp,
+                    is_error_frame=True,
+                )
+                log.debug(
+                    "bus error frame %#x %s",
+                    message.arbitration_id,
+                    bytes(message.data).hex(),
+                )
+                continue
+            if not message.is_extended_id:
                 continue
             # Corrupt frames are not a theoretical concern: python-can's slcan
             # backend parses the identifier with int(text, 16) and no range

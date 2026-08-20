@@ -165,3 +165,58 @@ def test_frame_loss_is_recorded_as_it_happens(scripted):
         assert not client.quality.healthy
     finally:
         client.close()
+
+
+def error_frame(classes: int, data: bytes) -> can.Message:
+    """What a driver hands up when the controller reports trouble.
+
+    python-can masks the error flag off the identifier and sets
+    ``is_error_frame`` instead, so the class bits arrive in
+    ``arbitration_id`` -- which is why the live path can name the fault and a
+    candump log cannot.
+    """
+    return can.Message(
+        arbitration_id=classes,
+        data=data,
+        is_extended_id=False,
+        is_error_frame=True,
+        timestamp=2.0,
+    )
+
+
+def test_an_error_frame_is_counted_rather_than_discarded(scripted):
+    """It used to be dropped one line before anything could count it.
+
+    An error frame is the only direct evidence the bus produces about its own
+    electrical health, and on this bike they arrive in bursts under motor
+    load.
+    """
+    # CAN_ERR_PROT | CAN_ERR_BUSERROR, data[2] = frame format error.
+    frame = error_frame(0x88, bytes.fromhex("0000020000000001"))
+    seen: list[object] = []
+
+    bus, client = scripted([frame, sensor_frame(1), frame], seen.append)
+    try:
+        assert bus.drained.wait(timeout=5)
+        time.sleep(0.1)  # let the dispatch thread catch up
+        assert client.quality.bus_errors == 2
+        assert client.quality.invalid_ids == 0
+        assert len(seen) == 1, "an error frame is not a message from a node"
+    finally:
+        client.close()
+
+
+def test_the_live_path_can_name_the_error_class(scripted):
+    """The identifier survives here, so the report is specific."""
+    frame = error_frame(0x88, bytes.fromhex("0000040000000001"))
+
+    bus, client = scripted([frame])
+    try:
+        assert bus.drained.wait(timeout=5)
+        time.sleep(0.1)
+        described = client.quality.errors[0].describe()
+    finally:
+        client.close()
+
+    assert "protocol violation" in described
+    assert "bit stuffing error" in described

@@ -22,6 +22,13 @@ reported any of it at the time:
   whole recording is real, but its timing is fiction. One capture here is
   compressed 54x this way.
 
+* **Bus errors.** The adapter reports a malformed frame on the wire as an
+  error frame, which is not a message from any node and decodes as garbage if
+  treated as one. This tool used to throw them away as corrupt identifiers --
+  and with them the only direct evidence the bus has of its own electrical
+  health. On the ride in ``docs/m200.md`` all eight of them arrive inside the
+  two seconds of highest motor current.
+
 None of these are Bafang-specific beyond the counter offset, and none of them
 need a second recording to detect.
 """
@@ -56,6 +63,129 @@ SEQUENCE_COUNTERS: dict[tuple[int, int, int], int] = {
 #: dropped -- an unlisted address could be a device this tool does not know.
 KNOWN_DEVICES = frozenset(int(d) for d in DeviceId)
 
+#: SocketCAN's error-frame flag. An error frame is not a message from a node:
+#: it is the CAN controller reporting that a frame on the wire was malformed,
+#: that arbitration was lost, or that the controller itself is in trouble. The
+#: error classes ride in the low 29 bits and the detail in the payload.
+CAN_ERR_FLAG = 0x2000_0000
+
+CAN_ERR_TX_TIMEOUT = 0x0000_0001
+CAN_ERR_LOSTARB = 0x0000_0002
+CAN_ERR_CRTL = 0x0000_0004
+CAN_ERR_PROT = 0x0000_0008
+CAN_ERR_TRX = 0x0000_0010
+CAN_ERR_ACK = 0x0000_0020
+CAN_ERR_BUSOFF = 0x0000_0040
+CAN_ERR_BUSERROR = 0x0000_0080
+CAN_ERR_RESTARTED = 0x0000_0100
+CAN_ERR_CNT = 0x0000_0200
+
+#: The one identifier ``can.CanutilsLogWriter`` writes for an error frame,
+#: whatever the frame actually said::
+#:
+#:     if msg.is_error_frame:
+#:         framestr += f" {CAN_ERR_FLAG | CAN_ERR_BUSERROR:08X}#"
+#:
+#: So in a candump log this value is python-can's stamp, not the controller's
+#: error class -- the class does not survive the format, and the reader that
+#: parses it back drops the payload as well. The payload *is* preserved on the
+#: way out, which is why this module reads candump text directly.
+#:
+#: A real Bafang frame cannot collide with it: the low 29 bits decode to source
+#: 0, which is not a device on the bus.
+CAN_ERROR_STAMP = CAN_ERR_FLAG | CAN_ERR_BUSERROR
+
+#: data[2] of an error frame, when the ``CAN_ERR_PROT`` class is set.
+PROTOCOL_ERRORS: dict[int, str] = {
+    0x00: "unspecified",
+    0x01: "single bit error",
+    0x02: "frame format error",
+    0x04: "bit stuffing error",
+    0x08: "dominant bit where recessive was expected",
+    0x10: "recessive bit where dominant was expected",
+    0x20: "bus overload",
+    0x40: "active error announcement",
+    0x80: "error while transmitting",
+}
+
+#: data[1] of an error frame, when the ``CAN_ERR_CRTL`` class is set.
+CONTROLLER_ERRORS: dict[int, str] = {
+    0x01: "receive buffer overflow",
+    0x02: "transmit buffer overflow",
+    0x04: "receive error counter in the warning band",
+    0x08: "transmit error counter in the warning band",
+    0x10: "receiver has gone error-passive",
+    0x20: "transmitter has gone error-passive",
+    0x40: "back to error-active",
+}
+
+#: Error classes, for reporting. Ordered worst first.
+ERROR_CLASSES: list[tuple[int, str]] = [
+    (CAN_ERR_BUSOFF, "bus off"),
+    (CAN_ERR_TRX, "transceiver fault"),
+    (CAN_ERR_PROT, "protocol violation"),
+    (CAN_ERR_ACK, "no acknowledgement"),
+    (CAN_ERR_CRTL, "controller status"),
+    (CAN_ERR_LOSTARB, "arbitration lost"),
+    (CAN_ERR_TX_TIMEOUT, "transmit timeout"),
+    (CAN_ERR_BUSERROR, "bus error"),
+    (CAN_ERR_RESTARTED, "controller restarted"),
+]
+
+
+@dataclass
+class BusError:
+    """One error frame: the controller reporting trouble on the wire.
+
+    ``classes`` is ``None`` when the source could not preserve it -- a candump
+    log stamps every error frame with the same identifier, so offline the only
+    honest answer about the error class is that it is unknown. The payload
+    still carries the protocol error and the error counters.
+    """
+
+    timestamp: float
+    classes: int | None
+    data: bytes
+
+    @property
+    def protocol_error(self) -> int | None:
+        return self.data[2] if len(self.data) > 2 else None
+
+    @property
+    def controller_error(self) -> int | None:
+        return self.data[1] if len(self.data) > 1 else None
+
+    @property
+    def counters(self) -> tuple[int, int] | None:
+        """``(transmit, receive)`` error counters, or None.
+
+        The kernel only guarantees these when ``CAN_ERR_CNT`` is set, and that
+        bit is one of the things a candump log destroys. They are reported
+        where the payload is long enough to hold them, and the caller should
+        read them as the adapter's claim rather than as a promise.
+        """
+        if len(self.data) < 8:
+            return None
+        return self.data[6], self.data[7]
+
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.classes is not None:
+            named = [name for bit, name in ERROR_CLASSES if self.classes & bit]
+            parts.append(", ".join(named) if named else "unspecified")
+        protocol = self.protocol_error
+        if protocol is not None and (self.classes is None or protocol):
+            parts.append(PROTOCOL_ERRORS.get(protocol, f"protocol {protocol:#04x}"))
+        controller = self.controller_error
+        if controller:
+            parts.append(
+                CONTROLLER_ERRORS.get(controller, f"controller {controller:#04x}")
+            )
+        counters = self.counters
+        if counters and any(counters):
+            parts.append(f"error counters tx {counters[0]} rx {counters[1]}")
+        return "; ".join(parts) if parts else "unspecified"
+
 
 def shortest_frame_time(bitrate: int = BITRATE) -> float:
     """Seconds the shortest extended frame occupies the bus."""
@@ -88,7 +218,9 @@ class LinkQuality:
     too_fast: int = 0
     counted: int = 0
     lost: int = 0
+    bus_errors: int = 0
     gaps: list[SequenceGap] = field(default_factory=list)
+    errors: list[BusError] = field(default_factory=list)
 
     _last_counter: dict[tuple[int, int, int], int] = field(
         default_factory=dict, repr=False
@@ -102,15 +234,40 @@ class LinkQuality:
     #: frames should not produce thousands of lines.
     MAX_LISTED_GAPS = 20
 
+    #: Error frames come in bursts -- eight in two seconds in the ride this was
+    #: written for -- and a bus that is failing continuously would otherwise
+    #: fill the report with the same line.
+    MAX_LISTED_ERRORS = 20
+
     def observe(
-        self, can_id: int, data: bytes, timestamp: float = 0.0
+        self,
+        can_id: int,
+        data: bytes,
+        timestamp: float = 0.0,
+        is_error_frame: bool = False,
     ) -> bool:
         """Record one raw frame. Returns False if it should not be trusted.
 
-        A False return means the identifier could not have come off a CAN bus,
-        so the caller should drop the frame rather than decode it.
+        A False return means the frame is not a message from a node, so the
+        caller should not decode it: either the identifier could not have come
+        off a CAN bus, or the frame is the controller reporting an error.
+
+        ``is_error_frame`` is what a live driver says. Offline there is no such
+        flag, so :data:`CAN_ERROR_STAMP` stands in for it -- see that constant
+        for why an exact match is the right test and not a mask.
         """
         self.frames += 1
+
+        if is_error_frame or can_id == CAN_ERROR_STAMP:
+            # Live, the class bits survive in the identifier because python-can
+            # masks off only the flag above them. Offline they do not survive
+            # at all, and claiming a class we did not read would be worse than
+            # saying so.
+            classes = can_id & CAN_EFF_MASK if is_error_frame else None
+            self.bus_errors += 1
+            if len(self.errors) < self.MAX_LISTED_ERRORS:
+                self.errors.append(BusError(timestamp, classes, bytes(data)))
+            return False
 
         if can_id > CAN_EFF_MASK or can_id < 0:
             self.invalid_ids += 1
@@ -180,11 +337,18 @@ class LinkQuality:
 
     @property
     def healthy(self) -> bool:
+        """True when nothing about this stream contradicts itself.
+
+        Bus errors count against it. Every other item here is damage between
+        the wire and the log; an error frame is damage on the wire itself, and
+        a frame destroyed there never reaches any recorder to be missed.
+        """
         return not (
             self.lost
             or self.invalid_ids
             or self.too_fast
             or self.implausible_devices
+            or self.bus_errors
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -196,10 +360,20 @@ class LinkQuality:
             "lost_frames": self.lost,
             "duplicate_frames": self.duplicates,
             "frames_faster_than_the_bus": self.too_fast,
+            "bus_errors": self.bus_errors,
         }
         ratio = self.loss_ratio
         if ratio is not None:
             out["loss_percent"] = round(ratio * 100, 1)
+        if self.errors:
+            out["errors"] = [
+                {
+                    "at": round(error.timestamp, 3),
+                    "detail": error.describe(),
+                    "raw": error.data.hex(),
+                }
+                for error in self.errors
+            ]
         if self.gaps:
             out["gaps"] = [
                 {
@@ -216,6 +390,25 @@ class LinkQuality:
     def warnings(self) -> list[str]:
         """Plain-language problems, worst first. Empty when the link is clean."""
         out: list[str] = []
+        if self.bus_errors:
+            detail = ""
+            if self.errors:
+                span = self.errors[-1].timestamp - self.errors[0].timestamp
+                kinds = sorted({error.describe() for error in self.errors})
+                detail = (
+                    f" They span {span:.1f} s and report: "
+                    + "; ".join(kinds)
+                    + "."
+                )
+            out.append(
+                f"{self.bus_errors} error frames: the CAN controller reporting "
+                "that a frame on the wire was malformed, not a message from a "
+                f"node.{detail} Frames destroyed this way are gone before any "
+                "recorder sees them, so they cannot show up as loss. On this "
+                "bike they arrive with motor current -- check what the drive "
+                "unit was drawing at those timestamps before suspecting the "
+                "adapter."
+            )
         ratio = self.loss_ratio
         if ratio:
             out.append(
@@ -230,7 +423,9 @@ class LinkQuality:
                 f"{self.invalid_ids} frames carried an identifier wider than the "
                 "29 bits CAN has, so they are corrupt and were dropped. On slcan "
                 "that is a lost serial byte resynchronising mid-frame; the real "
-                "frames it destroyed are gone too."
+                "frames it destroyed are gone too. Error frames are not counted "
+                "here -- those are a working adapter reporting a failing bus, "
+                "and they are reported separately."
             )
         if self.too_fast:
             floor = shortest_frame_time(self.bitrate)
@@ -261,10 +456,17 @@ def analyse(messages: Any, bitrate: int = BITRATE) -> LinkQuality:
     """Run :class:`LinkQuality` over python-can messages from a log."""
     quality = LinkQuality(bitrate=bitrate)
     for message in messages:
-        if not getattr(message, "is_extended_id", False):
+        error = bool(getattr(message, "is_error_frame", False))
+        # An error frame does not carry the extended-id flag -- it is not an
+        # addressed frame at all -- so it has to be tested for before the
+        # extended-only filter, or it is silently skipped.
+        if not error and not getattr(message, "is_extended_id", False):
             continue
         quality.observe(
-            message.arbitration_id, bytes(message.data), message.timestamp
+            message.arbitration_id,
+            bytes(message.data),
+            message.timestamp,
+            is_error_frame=error,
         )
     return quality
 

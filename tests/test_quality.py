@@ -13,6 +13,7 @@ import pytest
 
 from bafang_can.frame import CAN_EFF_MASK
 from bafang_can.quality import (
+    CAN_ERROR_STAMP,
     LinkQuality,
     analyse_log,
     iter_candump,
@@ -189,3 +190,54 @@ class TestAgainstAHealthyCapture:
 
         assert quality.counted == 62
         assert quality.loss_ratio == 0.0
+
+
+class TestErrorFrames:
+    """A working adapter reporting a failing bus, not a damaged recording."""
+
+    def test_the_offline_stamp_is_recognised(self):
+        quality = LinkQuality()
+
+        assert quality.observe(CAN_ERROR_STAMP, b"\x00\x00\x02\x00", 1.0) is False
+        assert quality.bus_errors == 1
+        assert quality.invalid_ids == 0
+
+    def test_a_corrupt_identifier_that_shares_the_flag_is_still_corrupt(self):
+        """0x2F830100 has the error flag bit set and is not an error frame.
+
+        This is why the offline test is an exact match against the one
+        identifier python-can writes, and not a mask against the flag: slcan
+        corruption lands on identifiers with that bit set all the time.
+        """
+        quality = LinkQuality()
+
+        assert quality.observe(0x2F830100, b"", 1.0) is False
+        assert quality.bus_errors == 0
+        assert quality.invalid_ids == 1
+
+    def test_a_live_frame_keeps_its_class_bits(self):
+        quality = LinkQuality()
+        quality.observe(0x88, bytes.fromhex("0000020000000001"), 1.0, True)
+
+        assert quality.errors[0].classes == 0x88
+        assert "frame format error" in quality.errors[0].describe()
+
+    def test_the_error_counters_are_reported_but_not_promised(self):
+        """The kernel only guarantees them when CAN_ERR_CNT is set.
+
+        That bit is one of the things a candump log destroys, so they are
+        offered as the adapter's claim rather than as a reading.
+        """
+        quality = LinkQuality()
+        quality.observe(CAN_ERROR_STAMP, bytes.fromhex("0000020000000003"), 1.0)
+
+        assert quality.errors[0].counters == (0, 3)
+        assert quality.errors[0].classes is None
+
+    def test_a_burst_does_not_fill_the_report(self):
+        quality = LinkQuality()
+        for index in range(quality.MAX_LISTED_ERRORS + 10):
+            quality.observe(CAN_ERROR_STAMP, b"\x00" * 8, float(index))
+
+        assert quality.bus_errors == quality.MAX_LISTED_ERRORS + 10
+        assert len(quality.errors) == quality.MAX_LISTED_ERRORS

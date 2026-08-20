@@ -286,3 +286,52 @@ def test_a_profile_built_from_a_damaged_capture_still_reports_the_damage(tmp_pat
     assert not quality.healthy
     # And the frames that did survive are still usable.
     assert profile_from_log(fixture).responses
+
+
+def test_an_error_frame_never_reaches_a_profile():
+    """Its payload is error-class detail and decodes as a plausible answer.
+
+    ``0000020000000001`` under a masked identifier would be recorded as six
+    bytes a device sent, and the simulator would replay it as if a bike had
+    answered that way.
+    """
+    import can
+
+    error = can.Message(
+        arbitration_id=0x88,
+        data=bytes.fromhex("0000020000000001"),
+        is_extended_id=False,
+        is_error_frame=True,
+        timestamp=1.0,
+    )
+    good = can.Message(
+        arbitration_id=BafangId(
+            source=int(DeviceId.BATTERY),
+            target=int(DeviceId.DISPLAY),
+            operation=int(CanOperation.NORMAL_ACK),
+            code=0x64,
+            subcode=0x01,
+        ).encode(),
+        data=bytes.fromhex("0b0062175a02"),
+        is_extended_id=True,
+        timestamp=1.1,
+    )
+
+    recovered = list(assemble([error, good, error]))
+
+    assert len(recovered) == 1
+    assert recovered[0].data == bytes.fromhex("0b0062175a02")
+
+
+def test_a_ride_log_carries_error_frames_past_the_profile_builder():
+    """The whole excerpt goes in; the eight error frames do not come out."""
+    from bafang_can.quality import analyse_log
+
+    fixture = Path(__file__).parent / "data" / "ride-bus-errors-excerpt.log"
+
+    assert analyse_log(fixture).bus_errors == 8
+    profile = profile_from_log(fixture)
+    assert all(
+        bytes.fromhex(payload) != bytes.fromhex("0000020000000001")
+        for payload in profile.responses.values()
+    )

@@ -68,3 +68,59 @@ only ever tested on broken input is not known to accept good input.
 
 It contains no serial or customer numbers, for the same reason as the file
 above.
+
+## `ride-*.log`
+
+Three excerpts of one 102 s road ride, recorded 2026-08-20 through the same
+candleLight 2.5 adapter in passive mode, on the same G210 -- but with the
+36 V pack fitted and the bike actually moving. Every other capture in this
+directory was taken on a stand or off a bench supply.
+
+The full log is clean: 16807 frames, no lost broadcasts, no duplicates, no
+impossible timing. That is worth stating on its own, because it is the gs_usb
+receive path validated at road speed with a motor pulling 15 A a metre away
+from the wiring.
+
+| file | window | what it is for |
+| --- | --- | --- |
+| `ride-bus-errors-excerpt.log` | 2.7 s, 450 frames | All eight error frames of the ride, and the peak current that comes with them. |
+| `ride-above-cutoff-excerpt.log` | 3.0 s, 493 frames | 24.1 to 26.6 km/h with the motor still pulling. |
+| `ride-coasting-excerpt.log` | 3.0 s, 493 frames | The rider stops pedalling while the bike rolls on at 25 km/h. |
+
+**The error frames are the point of the first file.** They are not corruption:
+the adapter is reporting that a frame on the wire was malformed, and it names
+the fault -- frame format errors and bit stuffing errors. All eight arrive
+inside 2.1 s, and that window is the highest motor current of the whole ride:
+15.1 A, with the pack sagging from 37.2 V to 34.2 V. Nothing else in the
+capture points at the motor. The drive unit reports no fault, every node keeps
+broadcasting, and no sequence counter skips.
+
+python-can writes one identifier, `20000080`, for every error frame regardless
+of what the controller said, so the *class* does not survive a candump log even
+though the payload does. The tests assert that the class reads as unknown
+offline rather than as the bus error that stamp would imply.
+
+**The second file is what a written speed limit does to a motor.** 45 km/h was
+written to `32/03` earlier that day; stock firmware cuts assist at 25.0. Here
+the drive unit holds 11--13 A through 25.5, 25.9, 26.2 and 26.6 km/h. The
+`32/03` broadcast is in the excerpt too, so the capture carries its own proof
+of what the bike was configured to do.
+
+**The third file identifies `0x32/0x08`,** which appears in no published table.
+It reads like watts and peaks at 581 across the ride. Through this window the
+drive unit reports 0.0 A for every single sample -- the motor is doing nothing
+-- and the field still reads 42, then 34, then falls to 0 as the rider stops
+pedalling, while the bike is still rolling at 25 km/h. So it is not motor
+power and it is not speed. It is rider-side. The scale is *not* claimed: fitting
+it against `(torque - rest) * cadence` over the whole ride gives a coefficient
+spanning an order of magnitude, because the torque broadcast is instantaneous
+within a pedal stroke and this field is not.
+
+These carry no serial or customer numbers: they are broadcast traffic, and
+nothing on this bus broadcasts an identity. The battery's own frames
+(`34/00`, `34/01`, `34/02`) are here, which no other fixture has, and they
+cross-check against the drive unit: both report 52% state of charge, and the
+pack's terminal voltage agrees with the drive unit's sense reading to within
+2%. That last one is the regression test for the 1.374x gain fault in
+`docs/m200.md` -- the same comparison that read 51.50 V against a 37.47 V pack
+before the repair.
